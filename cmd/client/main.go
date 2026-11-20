@@ -231,6 +231,13 @@ func runInfo(args []string) {
 		info.Metrics.RelayConnections, info.Metrics.BytesSent, info.Metrics.BytesReceived)
 	fmt.Printf("p2p: attempts=%d successes=%d success_rate=%.2f\n",
 		info.Metrics.P2PAttempts, info.Metrics.P2PSuccesses, info.Metrics.P2PSuccessRate)
+	if len(info.Metrics.Tunnels) > 0 {
+		fmt.Println("tunnels:")
+		for _, t := range info.Metrics.Tunnels {
+			fmt.Printf("  %s  proto=%s  conns=%d  tx=%d  rx=%d  local=%s\n",
+				t.TunnelID, t.Protocol, t.ActiveConns, t.BytesSent, t.BytesReceived, t.LocalAddr)
+		}
+	}
 }
 
 func runTunnel(args []string) {

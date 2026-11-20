@@ -16,6 +16,7 @@ import (
 	clientservice "iplink/internal/client/service"
 	"iplink/internal/config"
 	"iplink/internal/logger"
+	"iplink/internal/metrics"
 	"iplink/internal/nat/discovery"
 	dgramcrypto "iplink/internal/security/crypto"
 	serverservice "iplink/internal/server/service"
@@ -498,5 +499,132 @@ func TestHTTPReverseProxyMultiRoutes(t *testing.T) {
 	_ = resp404.Body.Close()
 	if resp404.StatusCode != http.StatusNotFound {
 		t.Fatalf("unknown path status = %d, want 404", resp404.StatusCode)
+	}
+}
+
+func TestTunnelRuntimeStats(t *testing.T) {
+	const token = "stats-secret-token"
+	srv, ctrlPort, relayPort, natPort, stopSrv := startTestServer(t, token)
+	defer stopSrv()
+
+	// Local TCP echo target.
+	echoLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer echoLn.Close()
+	go func() {
+		for {
+			c, err := echoLn.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer conn.Close()
+				_, _ = io.Copy(conn, conn)
+			}(c)
+		}
+	}()
+
+	cliCfg := config.DefaultClientConfig()
+	cliCfg.Client.ID = "stats-client"
+	cliCfg.Server.Address = "127.0.0.1"
+	cliCfg.Server.Port = ctrlPort
+	cliCfg.Server.RelayPort = relayPort
+	cliCfg.Server.NATPort = natPort
+	cliCfg.Security.Token = token
+	cliCfg.Tunnels = []config.TunnelConfig{{
+		Name:       "stats-tcp",
+		Protocol:   "tcp",
+		LocalAddr:  echoLn.Addr().String(),
+		RemoteAddr: "127.0.0.1:0",
+	}}
+
+	cli, err := clientservice.New(cliCfg, logger.New("warn", "text", io.Discard))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	doneCh, err := cli.Start(ctx)
+	if err != nil {
+		t.Fatalf("client Start: %v", err)
+	}
+	defer func() { cancel(); <-doneCh }()
+
+	var bound string
+	for _, at := range cli.ActiveTunnels() {
+		if at.Protocol == "tcp" {
+			bound = at.BoundAddr
+		}
+	}
+	if bound == "" {
+		t.Fatal("no TCP tunnel bound")
+	}
+
+	// No connections yet: tunnel registered with zero counters.
+	findTunnel := func() metrics.TunnelStats {
+		t.Helper()
+		for _, ts := range srv.Metrics().Tunnels {
+			if ts.Protocol == "tcp" {
+				return ts
+			}
+		}
+		t.Fatal("no TCP tunnel stats in snapshot")
+		return metrics.TunnelStats{}
+	}
+	if initial := findTunnel(); initial.ActiveConns != 0 || initial.BytesSent != 0 || initial.BytesReceived != 0 {
+		t.Fatalf("initial stats = %+v, want all zero", initial)
+	}
+
+	// Open a connection and send data through the tunnel.
+	conn, err := net.DialTimeout("tcp", bound, 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial tunnel: %v", err)
+	}
+	payload := []byte("hello-tunnel-stats")
+	if _, err := conn.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, len(payload))
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		t.Fatalf("read echo: %v", err)
+	}
+	if !bytes.Equal(buf, payload) {
+		t.Fatalf("echo = %q, want %q", buf, payload)
+	}
+
+	// Active connection should be counted. Bytes may lag slightly behind the
+	// echo due to async forwarding, so poll with a deadline.
+	deadline := time.Now().Add(2 * time.Second)
+	var got metrics.TunnelStats
+	for time.Now().Before(deadline) {
+		got = findTunnel()
+		if got.ActiveConns == 1 && got.BytesReceived >= uint64(len(payload)) && got.BytesSent >= uint64(len(payload)) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if got.ActiveConns != 1 {
+		t.Fatalf("active_conns = %d, want 1", got.ActiveConns)
+	}
+	if got.BytesReceived < uint64(len(payload)) || got.BytesSent < uint64(len(payload)) {
+		t.Fatalf("bytes tx=%d rx=%d, want both >= %d", got.BytesSent, got.BytesReceived, len(payload))
+	}
+	if got.LocalAddr != echoLn.Addr().String() || got.Protocol != "tcp" {
+		t.Fatalf("stats metadata = %+v", got)
+	}
+
+	// Close the connection; active count should return to zero.
+	conn.Close()
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if findTunnel().ActiveConns == 0 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if final := findTunnel(); final.ActiveConns != 0 {
+		t.Fatalf("active_conns after close = %d, want 0", final.ActiveConns)
 	}
 }

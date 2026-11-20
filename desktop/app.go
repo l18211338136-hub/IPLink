@@ -95,13 +95,15 @@ func (a *App) SaveConfig(cfg iplinkclient.Config) error {
 	return os.WriteFile(a.configPath, append(data, '\n'), 0o600)
 }
 
-// Connect saves the config, validates it, and starts the IPLink client in the background.
+// Connect validates the config, persists it, and starts the IPLink client in the background.
 func (a *App) Connect(cfg iplinkclient.Config) error {
-	if err := a.SaveConfig(cfg); err != nil {
-		return err
-	}
+	// Validate before writing to disk so an invalid config never overwrites
+	// the user's last known-good configuration.
 	expanded, err := iplinkclient.ExpandAndValidate(cfg)
 	if err != nil {
+		return err
+	}
+	if err := a.SaveConfig(cfg); err != nil {
 		return err
 	}
 
@@ -268,7 +270,9 @@ func (a *App) ImportConfig() (*iplinkclient.Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("解析配置失败: %w", err)
 	}
-	_ = a.SaveConfig(cfg)
+	if err := a.SaveConfig(cfg); err != nil {
+		return nil, fmt.Errorf("保存配置失败: %w", err)
+	}
 	return &cfg, nil
 }
 

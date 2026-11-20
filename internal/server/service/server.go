@@ -79,11 +79,13 @@ type Server struct {
 
 type proxyConn struct {
 	id        uint64
+	tunnelID  string // server-assigned tunnel ID, for per-tunnel counters
 	conn      net.Conn
 	sendCh    chan []byte
 	readyCh   chan bool
 	done      chan struct{}
 	closeOnce sync.Once
+	active    atomic.Bool // whether this conn has been counted as active
 }
 
 // New creates a new IPLink Server instance.
@@ -506,8 +508,10 @@ func (s *Server) handleTunnelCreate(ctx context.Context, sess *session.Session, 
 			return
 		}
 		s.metrics.ActiveTunnels.Add(1)
+		s.metrics.RegisterTunnel(tunID, "tcp", req.LocalAddr)
 		sess.RegisterTunnel(tunID, closerFunc(func() error {
 			s.metrics.ActiveTunnels.Add(-1)
+			s.metrics.UnregisterTunnel(tunID)
 			return ln.Close()
 		}))
 
@@ -538,12 +542,14 @@ func (s *Server) handleTunnelCreate(ctx context.Context, sess *session.Session, 
 		s.udpTunnels[tunID] = pc
 		s.udpMu.Unlock()
 		s.metrics.ActiveTunnels.Add(1)
+		s.metrics.RegisterTunnel(tunID, "udp", req.LocalAddr)
 
 		sess.RegisterTunnel(tunID, closerFunc(func() error {
 			s.udpMu.Lock()
 			delete(s.udpTunnels, tunID)
 			s.udpMu.Unlock()
 			s.metrics.ActiveTunnels.Add(-1)
+			s.metrics.UnregisterTunnel(tunID)
 			return pc.Close()
 		}))
 
@@ -571,9 +577,11 @@ func (s *Server) handleTunnelCreate(ctx context.Context, sess *session.Session, 
 			return
 		}
 		s.metrics.ActiveTunnels.Add(1)
+		s.metrics.RegisterTunnel(tunID, "http", req.LocalAddr)
 		sess.RegisterTunnel(tunID, closerFunc(func() error {
 			s.unregisterHTTPRoute(prefix, tunID)
 			s.metrics.ActiveTunnels.Add(-1)
+			s.metrics.UnregisterTunnel(tunID)
 			return nil
 		}))
 
@@ -621,11 +629,12 @@ func (s *Server) acceptTCPTunnel(ctx context.Context, sess *session.Session, tun
 		}
 		connID := s.nextConnID.Add(1)
 		pc := &proxyConn{
-			id:      connID,
-			conn:    extConn,
-			sendCh:  make(chan []byte, streamQueueSize),
-			readyCh: make(chan bool, 1),
-			done:    make(chan struct{}),
+			id:       connID,
+			tunnelID: tunID,
+			conn:     extConn,
+			sendCh:   make(chan []byte, streamQueueSize),
+			readyCh:  make(chan bool, 1),
+			done:     make(chan struct{}),
 		}
 		s.connsMu.Lock()
 		s.proxyConns[connID] = pc
@@ -659,6 +668,7 @@ func (s *Server) acceptTCPTunnel(ctx context.Context, sess *session.Session, tun
 				return
 			}
 
+			s.activateProxyConn(p)
 			s.wg.Add(2)
 			go func() {
 				defer s.wg.Done()
@@ -686,6 +696,9 @@ func (s *Server) writeProxyConnLoop(pc *proxyConn) {
 				return
 			}
 			s.metrics.BytesSent.Add(uint64(n))
+			if tc := s.metrics.Tunnel(pc.tunnelID); tc != nil {
+				tc.BytesSent.Add(uint64(n))
+			}
 		}
 	}
 }
@@ -704,6 +717,9 @@ func (s *Server) readProxyConnLoop(sess *session.Session, pc *proxyConn) {
 		n, err := pc.conn.Read(buf)
 		if n > 0 {
 			s.metrics.BytesReceived.Add(uint64(n))
+			if tc := s.metrics.Tunnel(pc.tunnelID); tc != nil {
+				tc.BytesReceived.Add(uint64(n))
+			}
 			dataFrame := codec.EncodeTunnelData(0, sess.ID, pc.id, buf[:n])
 			if sendErr := sess.SendFrame(dataFrame); sendErr != nil {
 				return
@@ -735,6 +751,16 @@ func (s *Server) forwardToProxyConn(connID uint64, data []byte) {
 	}
 }
 
+// activateProxyConn marks a proxy conn as established and increments the
+// per-tunnel active connection counter exactly once.
+func (s *Server) activateProxyConn(pc *proxyConn) {
+	if pc.active.CompareAndSwap(false, true) {
+		if tc := s.metrics.Tunnel(pc.tunnelID); tc != nil {
+			tc.ActiveConns.Add(1)
+		}
+	}
+}
+
 func (s *Server) closeProxyConn(connID uint64) {
 	s.connsMu.Lock()
 	pc, ok := s.proxyConns[connID]
@@ -746,6 +772,11 @@ func (s *Server) closeProxyConn(connID uint64) {
 		return
 	}
 	pc.closeOnce.Do(func() {
+		if pc.active.CompareAndSwap(true, false) {
+			if tc := s.metrics.Tunnel(pc.tunnelID); tc != nil {
+				tc.ActiveConns.Add(-1)
+			}
+		}
 		close(pc.done)
 		_ = pc.conn.Close()
 	})
@@ -778,6 +809,9 @@ func (s *Server) serveUDPTunnel(ctx context.Context, sess *session.Session, tunI
 			return
 		}
 		s.metrics.BytesReceived.Add(uint64(n))
+		if tc := s.metrics.Tunnel(tunID); tc != nil {
+			tc.BytesReceived.Add(uint64(n))
+		}
 		dgram := message.UDPDatagram{
 			TunnelID:   tunID,
 			PeerAddr:   peerAddr.String(),
@@ -808,6 +842,9 @@ func (s *Server) handleUDPFromClient(dgram message.UDPDatagram) {
 	n, err := pc.WriteTo(payload, addr)
 	if err == nil {
 		s.metrics.BytesSent.Add(uint64(n))
+		if tc := s.metrics.Tunnel(dgram.TunnelID); tc != nil {
+			tc.BytesSent.Add(uint64(n))
+		}
 	}
 }
 

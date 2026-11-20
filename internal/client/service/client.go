@@ -711,6 +711,30 @@ func (c *Client) ServerInfo(ctx context.Context) (message.ServerInfo, error) {
 	return info, nil
 }
 
+// ServerError is a protocol-level error frame returned by the server in
+// response to a synchronous request.
+type ServerError struct {
+	Code    protocol.ErrorCode
+	Message string
+}
+
+func (e *ServerError) Error() string {
+	return fmt.Sprintf("server error (%d): %s", e.Code, e.Message)
+}
+
+// serverErrorFromFrame converts a MsgError frame into a ServerError.
+// It returns nil for any non-error frame.
+func serverErrorFromFrame(f frame.Frame) error {
+	if f.Header.Type != protocol.MsgError {
+		return nil
+	}
+	var em message.ErrorMsg
+	if err := codec.DecodeJSON(f, &em); err != nil {
+		return fmt.Errorf("server error frame (undecodable): %w", err)
+	}
+	return &ServerError{Code: em.Code, Message: em.Message}
+}
+
 func (c *Client) sendRequest(ctx context.Context, msgType protocol.MessageType, payload any) (frame.Frame, error) {
 	reqID := c.nextReq.Add(1)
 	ch := make(chan frame.Frame, 1)
@@ -741,6 +765,11 @@ func (c *Client) sendRequest(ctx context.Context, msgType protocol.MessageType, 
 	case <-ctx.Done():
 		return frame.Frame{}, ctx.Err()
 	case resp := <-ch:
+		// A server-side error frame must surface as an error instead of being
+		// decoded into a zero-value reply by the caller.
+		if err := serverErrorFromFrame(resp); err != nil {
+			return frame.Frame{}, err
+		}
 		return resp, nil
 	case <-time.After(15 * time.Second):
 		return frame.Frame{}, fmt.Errorf("request %d timed out", reqID)

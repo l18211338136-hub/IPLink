@@ -20,8 +20,10 @@ type ServerConfig struct {
 
 // MetricsConfig configures the built-in Prometheus/JSON metrics endpoint.
 type MetricsConfig struct {
-	Enabled bool `json:"enabled"`
-	Port    int  `json:"port"`
+	Enabled  bool   `json:"enabled"`
+	Port     int    `json:"port"`
+	ListenIP string `json:"listen_ip,omitempty"` // defaults to 127.0.0.1 (loopback only)
+	Token    string `json:"token,omitempty"`     // if set, requests must present this token
 }
 
 // ServerListenConfig configures the server listening addresses and ports.
@@ -118,8 +120,9 @@ func DefaultServerConfig() ServerConfig {
 			MaxSessions: 1000,
 		},
 		Metrics: MetricsConfig{
-			Enabled: true,
-			Port:    29100,
+			Enabled:  true,
+			Port:     29100,
+			ListenIP: "127.0.0.1",
 		},
 		Logging: LoggingConfig{
 			Level:  "info",
@@ -229,6 +232,17 @@ func (c *ServerConfig) Validate() error {
 					return fmt.Errorf("metrics.port must be distinct from all server ports (got %d)", p)
 				}
 			}
+		}
+		listenIP := c.Metrics.ListenIP
+		if listenIP == "" {
+			listenIP = "127.0.0.1" // 兼容旧配置：未指定时收敛到 loopback
+		}
+		ip := net.ParseIP(listenIP)
+		if ip == nil {
+			return fmt.Errorf("invalid metrics.listen_ip %q: must be a valid IP address", listenIP)
+		}
+		if !ip.IsLoopback() && strings.TrimSpace(c.Metrics.Token) == "" {
+			return errors.New("metrics.token is required when metrics.listen_ip is not loopback")
 		}
 	}
 	if strings.TrimSpace(c.Security.Token) == "" {

@@ -81,6 +81,37 @@ func TestServerConfigMetricsPortValidation(t *testing.T) {
 			t.Fatalf("disabled metrics should skip port validation: %v", err)
 		}
 	})
+
+	t.Run("default listen ip is loopback", func(t *testing.T) {
+		cfg := base()
+		if cfg.Metrics.ListenIP != "127.0.0.1" {
+			t.Fatalf("default metrics.listen_ip = %q, want 127.0.0.1", cfg.Metrics.ListenIP)
+		}
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("default config should validate: %v", err)
+		}
+	})
+
+	t.Run("invalid listen ip rejected", func(t *testing.T) {
+		cfg := base()
+		cfg.Metrics.ListenIP = "not-an-ip"
+		if err := cfg.Validate(); err == nil {
+			t.Fatal("expected invalid metrics.listen_ip to be rejected")
+		}
+	})
+
+	t.Run("public listen requires token", func(t *testing.T) {
+		cfg := base()
+		cfg.Metrics.ListenIP = "0.0.0.0"
+		cfg.Metrics.Token = ""
+		if err := cfg.Validate(); err == nil {
+			t.Fatal("expected public metrics listen without token to be rejected")
+		}
+		cfg.Metrics.Token = "tok"
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("public listen with token should validate: %v", err)
+		}
+	})
 }
 
 func TestClientConfigRejectsDomainName(t *testing.T) {

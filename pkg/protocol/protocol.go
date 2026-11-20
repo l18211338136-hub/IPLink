@@ -35,8 +35,7 @@ const (
 	MsgTunnelClose       MessageType = 0x0025
 	MsgUDPDatagram       MessageType = 0x0026
 
-	MsgNATProbe        MessageType = 0x0030
-	MsgNATProbeAck     MessageType = 0x0031
+	// 0x0030 / 0x0031 reserved (old NAT-over-TCP probe, unused since v2).
 	MsgPeerListReq     MessageType = 0x0032
 	MsgPeerListResp    MessageType = 0x0033
 	MsgPeerConnectReq  MessageType = 0x0034

@@ -73,7 +73,11 @@ func (s *Server) startMetrics(tlsConfig *tls.Config) error {
 	if !s.cfg.Metrics.Enabled {
 		return nil
 	}
-	addr := fmt.Sprintf("%s:%d", s.cfg.Server.ListenIP, s.cfg.Metrics.Port)
+	listenIP := s.cfg.Metrics.ListenIP
+	if listenIP == "" {
+		listenIP = "127.0.0.1"
+	}
+	addr := fmt.Sprintf("%s:%d", listenIP, s.cfg.Metrics.Port)
 	baseLn, err := net.Listen("tcp", addr)
 	if err != nil {
 		return fmt.Errorf("listen metrics %s: %w", addr, err)
@@ -84,7 +88,7 @@ func (s *Server) startMetrics(tlsConfig *tls.Config) error {
 	}
 	s.metricsLn = ln
 	s.metricsSrv = &http.Server{
-		Handler:           metrics.Handler(s.metrics),
+		Handler:           metrics.Handler(s.metrics, s.cfg.Metrics.Token),
 		ReadHeaderTimeout: 15 * time.Second,
 	}
 
@@ -207,11 +211,12 @@ func (s *Server) dialTunnelStream(serverCtx, dialCtx context.Context, route *htt
 	serverSide, clientSide := net.Pipe()
 	connID := s.nextConnID.Add(1)
 	pc := &proxyConn{
-		id:      connID,
-		conn:    clientSide,
-		sendCh:  make(chan []byte, streamQueueSize),
-		readyCh: make(chan bool, 1),
-		done:    make(chan struct{}),
+		id:       connID,
+		tunnelID: route.tunnelID,
+		conn:     clientSide,
+		sendCh:   make(chan []byte, streamQueueSize),
+		readyCh:  make(chan bool, 1),
+		done:     make(chan struct{}),
 	}
 	s.connsMu.Lock()
 	s.proxyConns[connID] = pc
@@ -250,6 +255,7 @@ func (s *Server) dialTunnelStream(serverCtx, dialCtx context.Context, route *htt
 		return nil, serverCtx.Err()
 	}
 
+	s.activateProxyConn(pc)
 	s.wg.Add(2)
 	go func() {
 		defer s.wg.Done()

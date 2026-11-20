@@ -19,7 +19,9 @@
   },
   "metrics": {
     "enabled": true,
-    "port": 29100
+    "port": 29100,
+    "listen_ip": "127.0.0.1",
+    "token": ""
   },
   "logging": {
     "level": "info",
