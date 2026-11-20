@@ -1,0 +1,19 @@
+# Binaries
+bin/
+iplink-server
+iplink-server.exe
+iplink-client
+iplink-client.exe
+*.exe
+*.out
+*.test
+
+# Local configs with secrets
+configs/*.json
+!configs/*.json.example
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

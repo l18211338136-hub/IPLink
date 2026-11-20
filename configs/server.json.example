@@ -1,0 +1,24 @@
+{
+  "server": {
+    "listen_ip": "0.0.0.0",
+    "control_port": 29000,
+    "relay_port": 29001,
+    "nat_port": 29002,
+    "http_proxy_port": 28080
+  },
+  "security": {
+    "tls_enabled": false,
+    "tls_cert_file": "",
+    "tls_key_file": "",
+    "token": "${IPLINK_TOKEN}"
+  },
+  "relay": {
+    "enabled": true,
+    "max_sessions": 1000,
+    "max_bytes_per_sec": 0
+  },
+  "logging": {
+    "level": "info",
+    "format": "json"
+  }
+}

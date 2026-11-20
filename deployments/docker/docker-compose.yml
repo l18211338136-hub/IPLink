@@ -1,0 +1,16 @@
+services:
+  iplink-server:
+    build:
+      context: ../..
+      dockerfile: deployments/docker/Dockerfile
+    container_name: iplink-server
+    restart: unless-stopped
+    environment:
+      - IPLINK_TOKEN=${IPLINK_TOKEN}
+    ports:
+      - "29000:29000/tcp"
+      - "29001:29001/udp"
+      - "29002:29002/udp"
+      - "28080:28080/tcp"
+    volumes:
+      - ../../configs/server.json:/etc/iplink/server.json:ro

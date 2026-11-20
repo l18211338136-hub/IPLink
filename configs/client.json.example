@@ -1,0 +1,48 @@
+{
+  "client": {
+    "id": "client-001"
+  },
+  "server": {
+    "address": "127.0.0.1",
+    "port": 29000,
+    "relay_port": 29001,
+    "nat_port": 29002
+  },
+  "security": {
+    "tls_enabled": false,
+    "tls_insecure_skip_verify": false,
+    "token": "${IPLINK_TOKEN}",
+    "allowed_targets": [
+      "127.0.0.1:*"
+    ]
+  },
+  "network": {
+    "enable_tcp": true,
+    "enable_udp": true,
+    "enable_p2p": true
+  },
+  "reconnect": {
+    "enabled": true,
+    "max_attempts": 0,
+    "interval_seconds": 5
+  },
+  "tunnels": [
+    {
+      "name": "web-app1",
+      "protocol": "http",
+      "local_addr": "127.0.0.1:3000",
+      "http_path": "/app1",
+      "strip_prefix": true
+    },
+    {
+      "name": "ssh-or-tcp",
+      "protocol": "tcp",
+      "local_addr": "127.0.0.1:8080",
+      "remote_addr": "0.0.0.0:18080"
+    }
+  ],
+  "logging": {
+    "level": "info",
+    "format": "text"
+  }
+}

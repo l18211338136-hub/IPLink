@@ -1,0 +1,15 @@
+[Unit]
+Description=IPLink Pure IP Network Tunneling Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/iplink/server.env
+ExecStart=/usr/local/bin/iplink-server start --config /etc/iplink/server.json
+Restart=always
+RestartSec=3
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
