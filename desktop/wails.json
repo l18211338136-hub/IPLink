@@ -1,0 +1,17 @@
+{
+  "$schema": "https://wails.io/schemas/config.v2.json",
+  "name": "IP Link",
+  "outputfilename": "iplink-desktop",
+  "frontend:install": "",
+  "frontend:build": "",
+  "wailsjsdir": "./frontend/dist",
+  "author": {
+    "name": "IPLink"
+  },
+  "info": {
+    "productName": "IP Link",
+    "productVersion": "1.0.0",
+    "copyright": "IPLink",
+    "comments": "IP Link Pure IP Tunneling Client"
+  }
+}
