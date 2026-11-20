@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"net"
@@ -10,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"iplink/internal/metrics"
 	"iplink/internal/protocol/codec"
 	"iplink/internal/protocol/message"
 	"iplink/internal/server/session"
@@ -36,14 +38,19 @@ func normalizeHTTPPath(p string) string {
 	return strings.TrimRight(p, "/")
 }
 
-func (s *Server) startHTTPProxy(ctx context.Context) error {
+func (s *Server) startHTTPProxy(ctx context.Context, tlsConfig *tls.Config) error {
 	if s.cfg.Server.HTTPProxyPort <= 0 {
 		return nil
 	}
 	addr := fmt.Sprintf("%s:%d", s.cfg.Server.ListenIP, s.cfg.Server.HTTPProxyPort)
-	ln, err := net.Listen("tcp", addr)
+	baseLn, err := net.Listen("tcp", addr)
 	if err != nil {
 		return fmt.Errorf("listen http_proxy %s: %w", addr, err)
+	}
+	// tls_enabled 时 HTTP 反向代理也走 HTTPS（复用服务端证书）。
+	ln := net.Listener(baseLn)
+	if tlsConfig != nil {
+		ln = tls.NewListener(baseLn, tlsConfig)
 	}
 	s.httpLn = ln
 	s.httpSrv = &http.Server{
@@ -59,6 +66,44 @@ func (s *Server) startHTTPProxy(ctx context.Context) error {
 		}
 	}()
 	return nil
+}
+
+// startMetrics starts the built-in metrics HTTP server if enabled.
+func (s *Server) startMetrics(tlsConfig *tls.Config) error {
+	if !s.cfg.Metrics.Enabled {
+		return nil
+	}
+	addr := fmt.Sprintf("%s:%d", s.cfg.Server.ListenIP, s.cfg.Metrics.Port)
+	baseLn, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("listen metrics %s: %w", addr, err)
+	}
+	ln := net.Listener(baseLn)
+	if tlsConfig != nil {
+		ln = tls.NewListener(baseLn, tlsConfig)
+	}
+	s.metricsLn = ln
+	s.metricsSrv = &http.Server{
+		Handler:           metrics.Handler(s.metrics),
+		ReadHeaderTimeout: 15 * time.Second,
+	}
+
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		if err := s.metricsSrv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			s.log.Warn("metrics server error", "err", err)
+		}
+	}()
+	return nil
+}
+
+// MetricsAddr returns the bound metrics listener address, or "" if disabled.
+func (s *Server) MetricsAddr() string {
+	if s.metricsLn == nil {
+		return ""
+	}
+	return s.metricsLn.Addr().String()
 }
 
 // HTTPProxyAddr returns the bound HTTP reverse proxy listener address, or "" if disabled.

@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -23,7 +24,8 @@ import (
 	"iplink/internal/protocol/message"
 	relaymgr "iplink/internal/relay/manager"
 	"iplink/internal/security/auth"
-	tlscfg "iplink/internal/security/crypto"
+	servercrypto "iplink/internal/security/crypto"
+	"iplink/internal/security/identity"
 	"iplink/internal/server/session"
 	tcptransport "iplink/internal/transport/tcp"
 	"iplink/pkg/protocol"
@@ -45,6 +47,11 @@ type Server struct {
 	natSrv   *discovery.Server
 	relayMgr *relaymgr.Manager
 
+	// 为空表示服务端未设置白名单，不限制客户端目标地址；
+	// 非空时按规则校验 req.LocalAddr，防止服务端被当作开放代理。
+	targetValidator *identity.TargetValidator
+	targetErr       error
+
 	controlLn net.Listener
 
 	connsMu    sync.RWMutex
@@ -59,6 +66,13 @@ type Server struct {
 	httpRoutes map[string]*httpRoute
 	httpLn     net.Listener
 	httpSrv    *http.Server
+
+	metricsLn  net.Listener
+	metricsSrv *http.Server
+
+	// dgramCipher 加密 NAT 发现与 Relay 转发的 UDP 数据报。
+	dgramCipher *servercrypto.DatagramCipher
+	tlsEnabled  bool
 
 	wg sync.WaitGroup
 }
@@ -75,23 +89,37 @@ type proxyConn struct {
 // New creates a new IPLink Server instance.
 func New(cfg config.ServerConfig, log *slog.Logger) *Server {
 	m := &metrics.Metrics{}
-	return &Server{
+	s := &Server{
 		cfg:        cfg,
 		log:        log,
 		metrics:    m,
+		tlsEnabled: cfg.Security.TLSEnabled,
 		sessions:   session.NewManager(m),
 		proxyConns: make(map[uint64]*proxyConn),
 		udpTunnels: make(map[string]net.PacketConn),
 		httpRoutes: make(map[string]*httpRoute),
 	}
+	if len(cfg.Security.AllowedTargets) > 0 {
+		// 显式配置白名单时才构造；空配置保持"不限制"以兼容内网转发场景。
+		s.targetValidator, s.targetErr = identity.NewTargetValidator(cfg.Security.AllowedTargets)
+	}
+	return s
 }
 
 // Start binds the control, NAT, and relay listeners and begins serving until ctx is cancelled.
 func (s *Server) Start(ctx context.Context) error {
+	if s.targetErr != nil {
+		return fmt.Errorf("invalid security.allowed_targets: %w", s.targetErr)
+	}
+	dc, err := servercrypto.NewDatagramCipher(s.cfg.Security.Token)
+	if err != nil {
+		return fmt.Errorf("derive datagram cipher: %w", err)
+	}
+	s.dgramCipher = dc
 	var tlsConfig *tls.Config
 	if s.cfg.Security.TLSEnabled {
 		var err error
-		tlsConfig, err = tlscfg.LoadServerTLSConfig(s.cfg.Security.TLSCertFile, s.cfg.Security.TLSKeyFile)
+		tlsConfig, err = servercrypto.LoadServerTLSConfig(s.cfg.Security.TLSCertFile, s.cfg.Security.TLSKeyFile)
 		if err != nil {
 			return err
 		}
@@ -105,7 +133,7 @@ func (s *Server) Start(ctx context.Context) error {
 	s.controlLn = ln
 
 	natAddr := fmt.Sprintf("%s:%d", s.cfg.Server.ListenIP, s.cfg.Server.NATPort)
-	natSrv, err := discovery.StartServer(ctx, natAddr, s.log)
+	natSrv, err := discovery.StartServer(ctx, natAddr, s.dgramCipher, s.log)
 	if err != nil {
 		_ = ln.Close()
 		return err
@@ -113,7 +141,7 @@ func (s *Server) Start(ctx context.Context) error {
 	s.natSrv = natSrv
 
 	relayAddr := fmt.Sprintf("%s:%d", s.cfg.Server.ListenIP, s.cfg.Server.RelayPort)
-	rMgr, err := relaymgr.Start(ctx, relayAddr, s.cfg.Relay.Enabled, s.cfg.Relay.MaxSessions, s.metrics, s.log)
+	rMgr, err := relaymgr.Start(ctx, relayAddr, s.cfg.Relay.Enabled, s.cfg.Relay.MaxSessions, s.cfg.Relay.MaxBytesPerSec, s.metrics, s.log)
 	if err != nil {
 		_ = natSrv.Close()
 		_ = ln.Close()
@@ -121,7 +149,17 @@ func (s *Server) Start(ctx context.Context) error {
 	}
 	s.relayMgr = rMgr
 
-	if err := s.startHTTPProxy(ctx); err != nil {
+	if err := s.startHTTPProxy(ctx, tlsConfig); err != nil {
+		_ = rMgr.Close()
+		_ = natSrv.Close()
+		_ = ln.Close()
+		return err
+	}
+
+	if err := s.startMetrics(tlsConfig); err != nil {
+		if s.httpSrv != nil {
+			_ = s.httpSrv.Close()
+		}
 		_ = rMgr.Close()
 		_ = natSrv.Close()
 		_ = ln.Close()
@@ -133,6 +171,7 @@ func (s *Server) Start(ctx context.Context) error {
 		"nat_addr", natSrv.Addr(),
 		"relay_addr", rMgr.Addr(),
 		"http_proxy_addr", s.HTTPProxyAddr(),
+		"metrics_addr", s.MetricsAddr(),
 		"tls", s.cfg.Security.TLSEnabled,
 	)
 
@@ -152,6 +191,11 @@ func (s *Server) Start(ctx context.Context) error {
 		if s.httpSrv != nil {
 			shutCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 			_ = s.httpSrv.Shutdown(shutCtx)
+			cancel()
+		}
+		if s.metricsSrv != nil {
+			shutCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			_ = s.metricsSrv.Shutdown(shutCtx)
 			cancel()
 		}
 		s.sessions.CloseAll()
@@ -206,6 +250,49 @@ func (s *Server) RelayAddr() string {
 // Metrics returns a snapshot of current server metrics.
 func (s *Server) Metrics() metrics.Snapshot {
 	return s.metrics.Snapshot()
+}
+
+// capabilities reports the services actually bound by this server instance.
+func (s *Server) capabilities() message.ServerCapabilities {
+	natAddr, relayAddr, httpAddr, metricsAddr := "", "", "", ""
+	if s.natSrv != nil {
+		natAddr = s.natSrv.Addr()
+	}
+	if s.relayMgr != nil {
+		relayAddr = s.relayMgr.Addr()
+	}
+	if s.httpLn != nil {
+		httpAddr = s.httpLn.Addr().String()
+	}
+	if s.metricsLn != nil {
+		metricsAddr = s.metricsLn.Addr().String()
+	}
+	return message.ServerCapabilities{
+		ProtocolVersion:  protocol.ProtocolVersion,
+		NATEnabled:       natAddr != "",
+		NATPort:          boundPort(natAddr),
+		RelayEnabled:     relayAddr != "",
+		RelayPort:        boundPort(relayAddr),
+		HTTPProxyEnabled: httpAddr != "",
+		HTTPProxyPort:    boundPort(httpAddr),
+		MetricsEnabled:   metricsAddr != "",
+		MetricsPort:      boundPort(metricsAddr),
+	}
+}
+
+func boundPort(addr string) int {
+	if addr == "" {
+		return 0
+	}
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return 0
+	}
+	p, err := strconv.Atoi(port)
+	if err != nil {
+		return 0
+	}
+	return p
 }
 
 func (s *Server) handleControlConn(ctx context.Context, conn net.Conn) {
@@ -278,8 +365,9 @@ func (s *Server) authenticate(conn net.Conn) (*session.Session, error) {
 
 	sess := s.sessions.Create(req.ClientID, conn, req.LocalAddr)
 	resp := message.AuthResponse{
-		Success:   true,
-		SessionID: sess.ID,
+		Success:      true,
+		SessionID:    sess.ID,
+		Capabilities: s.capabilities(),
 	}
 	respFrame, err := codec.EncodeJSON(protocol.MsgAuthResponse, reqFrame.Header.RequestID, sess.ID, resp)
 	if err != nil {
@@ -379,7 +467,20 @@ func (s *Server) dispatchFrame(ctx context.Context, sess *session.Session, f fra
 		s.handlePeerConnect(sess, f.Header.RequestID, req)
 
 	case protocol.MsgRelayAllocReq:
-		s.handleRelayAlloc(sess, f.Header.RequestID)
+		var req message.RelayAllocReq
+		if err := codec.DecodeJSON(f, &req); err != nil {
+			return
+		}
+		s.handleRelayAlloc(sess, f.Header.RequestID, req)
+
+	case protocol.MsgInfoReq:
+		info, err := codec.EncodeJSON(protocol.MsgInfoResp, f.Header.RequestID, sess.ID, message.ServerInfo{
+			Capabilities: s.capabilities(),
+			Metrics:      s.Metrics(),
+		})
+		if err == nil {
+			_ = sess.SendFrame(info)
+		}
 
 	default:
 		s.log.Debug("unknown message type", "type", f.Header.Type, "client_id", sess.ClientID)
@@ -387,6 +488,13 @@ func (s *Server) dispatchFrame(ctx context.Context, sess *session.Session, f fra
 }
 
 func (s *Server) handleTunnelCreate(ctx context.Context, sess *session.Session, reqID uint64, req message.TunnelCreate) {
+	if s.targetValidator != nil {
+		if err := s.targetValidator.Allow(req.LocalAddr); err != nil {
+			s.log.Warn("tunnel target denied by server policy", "client_id", sess.ClientID, "local", req.LocalAddr, "err", err)
+			s.sendTunnelCreateErr(sess, reqID, protocol.ErrTargetDenied, err.Error())
+			return
+		}
+	}
 	proto := strings.ToLower(strings.TrimSpace(req.Protocol))
 	tunID := fmt.Sprintf("tun-%d", s.nextTunID.Add(1))
 
@@ -469,7 +577,11 @@ func (s *Server) handleTunnelCreate(ctx context.Context, sess *session.Session, 
 			return nil
 		}))
 
-		bound := fmt.Sprintf("http://%s%s", s.HTTPProxyAddr(), prefix)
+		scheme := "http"
+		if s.tlsEnabled {
+			scheme = "https"
+		}
+		bound := fmt.Sprintf("%s://%s%s", scheme, s.HTTPProxyAddr(), prefix)
 		ack, err := codec.EncodeJSON(protocol.MsgTunnelCreateAck, reqID, sess.ID, message.TunnelCreateAck{
 			Success:   true,
 			TunnelID:  tunID,
@@ -732,7 +844,17 @@ func (s *Server) handlePeerConnect(sess *session.Session, reqID uint64, req mess
 	_ = target.SendFrame(infoForTarget)
 }
 
-func (s *Server) handleRelayAlloc(sess *session.Session, reqID uint64) {
+func (s *Server) handleRelayAlloc(sess *session.Session, reqID uint64, req message.RelayAllocReq) {
+	target, ok := s.sessions.GetByClientID(req.TargetClientID)
+	if !ok {
+		ack, _ := codec.EncodeJSON(protocol.MsgRelayAllocAck, reqID, sess.ID, message.RelayAllocAck{
+			Success:   false,
+			ErrorCode: protocol.ErrPeerNotFound,
+			Error:     "target peer not online: " + req.TargetClientID,
+		})
+		_ = sess.SendFrame(ack)
+		return
+	}
 	rid, err := s.relayMgr.Allocate()
 	if err != nil {
 		ack, _ := codec.EncodeJSON(protocol.MsgRelayAllocAck, reqID, sess.ID, message.RelayAllocAck{
@@ -749,6 +871,13 @@ func (s *Server) handleRelayAlloc(sess *session.Session, reqID uint64) {
 		RelayAddr:      s.relayMgr.Addr(),
 	})
 	_ = sess.SendFrame(ack)
+
+	notify, _ := codec.EncodeJSON(protocol.MsgRelayAllocNotify, 0, target.ID, message.RelayAllocNotify{
+		FromClientID:   sess.ClientID,
+		RelaySessionID: rid,
+		RelayAddr:      s.relayMgr.Addr(),
+	})
+	_ = target.SendFrame(notify)
 }
 
 type closerFunc func() error

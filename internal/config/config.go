@@ -14,7 +14,14 @@ type ServerConfig struct {
 	Server   ServerListenConfig `json:"server"`
 	Security SecurityConfig     `json:"security"`
 	Relay    RelayConfig        `json:"relay"`
+	Metrics  MetricsConfig      `json:"metrics"`
 	Logging  LoggingConfig      `json:"logging"`
+}
+
+// MetricsConfig configures the built-in Prometheus/JSON metrics endpoint.
+type MetricsConfig struct {
+	Enabled bool `json:"enabled"`
+	Port    int  `json:"port"`
 }
 
 // ServerListenConfig configures the server listening addresses and ports.
@@ -110,6 +117,10 @@ func DefaultServerConfig() ServerConfig {
 			Enabled:     true,
 			MaxSessions: 1000,
 		},
+		Metrics: MetricsConfig{
+			Enabled: true,
+			Port:    29100,
+		},
 		Logging: LoggingConfig{
 			Level:  "info",
 			Format: "text",
@@ -201,6 +212,23 @@ func (c *ServerConfig) Validate() error {
 		}
 		if c.Server.HTTPProxyPort == c.Server.ControlPort || c.Server.HTTPProxyPort == c.Server.RelayPort || c.Server.HTTPProxyPort == c.Server.NATPort {
 			return errors.New("server.http_proxy_port must be distinct from control_port, relay_port, and nat_port")
+		}
+	}
+	if c.Metrics.Enabled {
+		// 0 表示由内核动态分配端口，便于测试与避免冲突。
+		if c.Metrics.Port < 0 || c.Metrics.Port > 65535 {
+			return fmt.Errorf("invalid metrics.port %d: must be 0 or between 1 and 65535", c.Metrics.Port)
+		}
+		if c.Metrics.Port != 0 {
+			ports := []int{c.Server.ControlPort, c.Server.RelayPort, c.Server.NATPort}
+			if c.Server.HTTPProxyPort != 0 {
+				ports = append(ports, c.Server.HTTPProxyPort)
+			}
+			for _, p := range ports {
+				if c.Metrics.Port == p {
+					return fmt.Errorf("metrics.port must be distinct from all server ports (got %d)", p)
+				}
+			}
 		}
 	}
 	if strings.TrimSpace(c.Security.Token) == "" {

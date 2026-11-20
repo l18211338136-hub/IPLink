@@ -1,6 +1,7 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/base64"
@@ -9,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -23,17 +25,24 @@ import (
 	"iplink/internal/protocol/message"
 	relaymgr "iplink/internal/relay/manager"
 	"iplink/internal/security/auth"
-	tlscfg "iplink/internal/security/crypto"
+	clientcrypto "iplink/internal/security/crypto"
 	"iplink/internal/security/identity"
 	tcptransport "iplink/internal/transport/tcp"
 	"iplink/pkg/protocol"
 )
 
 const (
-	heartbeatInterval = 20 * time.Second
-	streamQueueSize   = 64
-	readChunkSize     = 32 * 1024
-	udpIdleTimeout    = 60 * time.Second
+	heartbeatInterval    = 20 * time.Second
+	missedPongLimit      = 3 // 连续 3 次心跳无 PONG 判定链路半开（默认 60s）
+	streamQueueSize      = 64
+	readChunkSize        = 32 * 1024
+	udpIdleTimeout       = 60 * time.Second
+	peerRecvQueueSize    = 64
+	peerPingInterval     = 300 * time.Millisecond
+	peerPingTimeout      = 3 * time.Second
+	peerPingPrefix       = "IPLINK_PING:"
+	peerPongPrefix       = "IPLINK_PONG:"
+	peerRelayJoinPayload = "IPLINK_JOIN"
 )
 
 // ActiveTunnel records a tunnel registered with the server.
@@ -69,7 +78,17 @@ type Client struct {
 	udpMu    sync.Mutex
 	udpPeers map[string]*udpPeerConn // "tunnelID|peerAddr" -> local UDP conn
 
+	peerMu   sync.Mutex
+	incoming map[string]*PeerChannel // peerID -> channel opened by remote peer
+
+	caps       message.ServerCapabilities
+	capsKnown  bool
 	publicAddr string
+
+	lastPong atomic.Int64 // UnixNano，最近一次收到 HeartbeatPong 的时间
+
+	// dgramCipher 加密 NAT 探测、P2P 打洞与 PeerChannel/Relay 数据报。
+	dgramCipher *clientcrypto.DatagramCipher
 }
 
 type localStream struct {
@@ -94,16 +113,22 @@ func New(cfg config.ClientConfig, log *slog.Logger) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
+	dc, err := clientcrypto.NewDatagramCipher(cfg.Security.Token)
+	if err != nil {
+		return nil, fmt.Errorf("derive datagram cipher: %w", err)
+	}
 	return &Client{
-		cfg:       cfg,
-		log:       log,
-		metrics:   &metrics.Metrics{},
-		validator: v,
-		tunnels:   make(map[string]ActiveTunnel),
-		localMap:  make(map[string]string),
-		pending:   make(map[uint64]chan frame.Frame),
-		streams:   make(map[uint64]*localStream),
-		udpPeers:  make(map[string]*udpPeerConn),
+		cfg:         cfg,
+		log:         log,
+		metrics:     &metrics.Metrics{},
+		validator:   v,
+		tunnels:     make(map[string]ActiveTunnel),
+		localMap:    make(map[string]string),
+		pending:     make(map[uint64]chan frame.Frame),
+		streams:     make(map[uint64]*localStream),
+		udpPeers:    make(map[string]*udpPeerConn),
+		incoming:    make(map[string]*PeerChannel),
+		dgramCipher: dc,
 	}, nil
 }
 
@@ -145,7 +170,7 @@ func (c *Client) Run(ctx context.Context) error {
 func (c *Client) ConnectOnce(ctx context.Context) error {
 	var tlsConfig *tls.Config
 	if c.cfg.Security.TLSEnabled {
-		tlsConfig = tlscfg.BuildClientTLSConfig(c.cfg.Security.TLSInsecureSkipVerify)
+		tlsConfig = clientcrypto.BuildClientTLSConfig(c.cfg.Security.TLSInsecureSkipVerify)
 	}
 	addr := fmt.Sprintf("%s:%d", c.cfg.Server.Address, c.cfg.Server.Port)
 	conn, err := tcptransport.Dial(ctx, addr, tlsConfig)
@@ -165,14 +190,14 @@ func (c *Client) ConnectOnce(ctx context.Context) error {
 	c.tunnels = make(map[string]ActiveTunnel)
 	c.localMap = make(map[string]string)
 	c.mu.Unlock()
+	c.lastPong.Store(time.Now().UnixNano()) // 认证完成即视为链路存活，Connected() 立即可用
 
 	c.log.Info("connected to IPLink server", "server", addr, "client_id", c.cfg.Client.ID, "session_id", sessID)
 
-	if c.cfg.Network.EnableP2P && c.cfg.Server.NATPort > 0 {
-		natAddr := fmt.Sprintf("%s:%d", c.cfg.Server.Address, c.cfg.Server.NATPort)
+	if natAddr := c.natEndpoint(); c.cfg.Network.EnableP2P && natAddr != "" {
 		if nonce, err := auth.GenerateNonce(); err == nil {
 			probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-			if pub, err := discovery.DiscoverPublicAddr(probeCtx, nil, natAddr, c.cfg.Client.ID, nonce); err == nil {
+			if pub, err := discovery.DiscoverPublicAddr(probeCtx, nil, natAddr, c.cfg.Client.ID, nonce, c.dgramCipher); err == nil {
 				c.mu.Lock()
 				c.publicAddr = pub
 				c.mu.Unlock()
@@ -216,6 +241,10 @@ func (c *Client) Start(ctx context.Context) (<-chan error, error) {
 	}()
 
 	for _, t := range c.cfg.Tunnels {
+		if !c.tunnelEnabled(t) {
+			c.log.Debug("skipping tunnel disabled by network config", "tunnel", t.Name, "protocol", t.Protocol)
+			continue
+		}
 		if _, err := c.RegisterTunnel(serveCtx, t); err != nil {
 			cancel()
 			c.cleanupSession()
@@ -249,8 +278,24 @@ func (c *Client) connectAndServe(ctx context.Context) error {
 	return <-doneCh
 }
 
+// tunnelEnabled reports whether the network config allows this tunnel's protocol.
+func (c *Client) tunnelEnabled(t config.TunnelConfig) bool {
+	switch strings.ToLower(strings.TrimSpace(t.Protocol)) {
+	case "tcp", "http":
+		return c.cfg.Network.EnableTCP
+	case "udp":
+		return c.cfg.Network.EnableUDP
+	default:
+		return true // 未知协议交给服务端校验报错
+	}
+}
+
 // RegisterTunnel requests the server to open a TCP or UDP tunnel and maps it to local_addr.
 func (c *Client) RegisterTunnel(ctx context.Context, t config.TunnelConfig) (ActiveTunnel, error) {
+	if !c.tunnelEnabled(t) {
+		proto := strings.ToLower(strings.TrimSpace(t.Protocol))
+		return ActiveTunnel{}, fmt.Errorf("tunnel protocol %q is disabled by network config", proto)
+	}
 	if err := c.validator.Allow(t.LocalAddr); err != nil {
 		return ActiveTunnel{}, err
 	}
@@ -321,9 +366,173 @@ func (c *Client) ListPeers(ctx context.Context) ([]message.PeerInfo, error) {
 // PeerChannel represents an established P2P or Relay UDP channel to a peer.
 type PeerChannel struct {
 	Mode     string // "p2p" or "relay"
+	PeerID   string
 	Conn     net.PacketConn
 	PeerAddr net.Addr
 	RelayID  string
+
+	cipher    *clientcrypto.DatagramCipher
+	recvCh    chan []byte
+	pongCh    chan []byte
+	done      chan struct{}
+	closeOnce sync.Once
+}
+
+func newPeerChannel(mode, peerID string, conn net.PacketConn, peerAddr net.Addr, relayID string, cipher *clientcrypto.DatagramCipher) *PeerChannel {
+	ch := &PeerChannel{
+		Mode:     mode,
+		PeerID:   peerID,
+		Conn:     conn,
+		PeerAddr: peerAddr,
+		RelayID:  relayID,
+		cipher:   cipher,
+		recvCh:   make(chan []byte, peerRecvQueueSize),
+		pongCh:   make(chan []byte, 8),
+		done:     make(chan struct{}),
+	}
+	go ch.readLoop()
+	return ch
+}
+
+func (ch *PeerChannel) readLoop() {
+	buf := make([]byte, protocol.MaxUDPPacketSize)
+	for {
+		n, _, err := ch.Conn.ReadFrom(buf)
+		if err != nil {
+			ch.Close()
+			return
+		}
+		payload := buf[:n]
+		if ch.Mode == "relay" {
+			sid, body, err := relaymgr.DecodeRelayPacket(payload)
+			if err != nil || sid != ch.RelayID {
+				continue
+			}
+			payload = body
+		}
+		plain, err := ch.cipher.Open(payload)
+		if err != nil {
+			continue // 非本通道密文或篡改包
+		}
+		if punching.IsPunchPacket(plain) {
+			continue // 打洞阶段的残留包
+		}
+		if bytes.HasPrefix(plain, []byte(peerPingPrefix)) {
+			reply := append([]byte(peerPongPrefix), plain[len(peerPingPrefix):]...)
+			_ = ch.Send(reply)
+			continue
+		}
+		if bytes.HasPrefix(plain, []byte(peerPongPrefix)) {
+			select {
+			case ch.pongCh <- plain:
+			case <-ch.done:
+				return
+			default:
+			}
+			continue
+		}
+		cp := append([]byte(nil), plain...)
+		select {
+		case ch.recvCh <- cp:
+		case <-ch.done:
+			return
+		default:
+		}
+	}
+}
+
+// Send writes payload to the peer, adding the relay session header when needed.
+func (ch *PeerChannel) Send(payload []byte) error {
+	select {
+	case <-ch.done:
+		return net.ErrClosed
+	default:
+	}
+	sealed := ch.cipher.Seal(payload)
+	data := sealed
+	if ch.Mode == "relay" {
+		data = relaymgr.EncodeRelayPacket(ch.RelayID, sealed)
+	}
+	_, err := ch.Conn.WriteTo(data, ch.PeerAddr)
+	return err
+}
+
+// Receive reads the next payload from the peer, honoring ctx cancellation.
+func (ch *PeerChannel) Receive(ctx context.Context) ([]byte, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-ch.done:
+		return nil, net.ErrClosed
+	case p := <-ch.recvCh:
+		return p, nil
+	}
+}
+
+// Ping measures round-trip time over the channel; the remote peer replies automatically.
+func (ch *PeerChannel) Ping(ctx context.Context) (time.Duration, error) {
+	start := time.Now()
+	token := strconv.FormatInt(start.UnixNano(), 10)
+	probe := append([]byte(peerPingPrefix), token...)
+	want := append([]byte(peerPongPrefix), token...)
+	deadline := time.Now().Add(peerPingTimeout)
+	ticker := time.NewTicker(peerPingInterval)
+	defer ticker.Stop()
+
+	if err := ch.Send(probe); err != nil {
+		return 0, err
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		case <-ch.done:
+			return 0, net.ErrClosed
+		case <-ticker.C:
+			if time.Now().After(deadline) {
+				return 0, fmt.Errorf("peer ping timeout after %s", peerPingTimeout)
+			}
+			_ = ch.Send(probe)
+		case p := <-ch.pongCh:
+			if bytes.Equal(p, want) {
+				return time.Since(start), nil
+			}
+		}
+	}
+}
+
+// Close releases the channel's socket and background reader.
+func (ch *PeerChannel) Close() error {
+	var err error
+	ch.closeOnce.Do(func() {
+		close(ch.done)
+		err = ch.Conn.Close()
+	})
+	return err
+}
+
+// RegisterIncoming stores a channel opened by a remote peer. A direct channel
+// always wins over a relay channel for the same peer.
+func (c *Client) RegisterIncoming(peerID string, ch *PeerChannel) {
+	c.peerMu.Lock()
+	old := c.incoming[peerID]
+	if old == nil || (old.Mode == "relay" && ch.Mode == "p2p") {
+		c.incoming[peerID] = ch
+		c.peerMu.Unlock()
+		if old != nil {
+			_ = old.Close()
+		}
+		return
+	}
+	c.peerMu.Unlock()
+	_ = ch.Close()
+}
+
+// IncomingPeer returns the channel opened by peerID, if any.
+func (c *Client) IncomingPeer(peerID string) *PeerChannel {
+	c.peerMu.Lock()
+	defer c.peerMu.Unlock()
+	return c.incoming[peerID]
 }
 
 // ConnectPeer attempts Direct-First UDP hole punching to targetClientID, falling back to Server Relay.
@@ -332,12 +541,12 @@ func (c *Client) ConnectPeer(ctx context.Context, targetClientID string) (*PeerC
 	if err != nil {
 		return nil, err
 	}
+	closePC := func() { _ = pc.Close() }
 
 	var myPub string
-	if c.cfg.Network.EnableP2P && c.cfg.Server.NATPort > 0 {
-		natAddr := fmt.Sprintf("%s:%d", c.cfg.Server.Address, c.cfg.Server.NATPort)
+	if natAddr := c.natEndpoint(); c.cfg.Network.EnableP2P && natAddr != "" {
 		if nonce, err := auth.GenerateNonce(); err == nil {
-			if pub, err := discovery.DiscoverPublicAddr(ctx, pc, natAddr, c.cfg.Client.ID, nonce); err == nil {
+			if pub, err := discovery.DiscoverPublicAddr(ctx, pc, natAddr, c.cfg.Client.ID, nonce, c.dgramCipher); err == nil {
 				myPub = pub
 			}
 		}
@@ -353,58 +562,54 @@ func (c *Client) ConnectPeer(ctx context.Context, targetClientID string) (*PeerC
 		if err == nil && respFrame.Header.Type == protocol.MsgPeerConnectInfo {
 			var info message.PeerConnectInfo
 			if codec.DecodeJSON(respFrame, &info) == nil {
-				peerAddr, punchErr := punching.Punch(ctx, pc, info.PunchToken, []string{info.PeerPublicAddr, info.PeerLocalAddr})
+				peerAddr, punchErr := punching.Punch(ctx, pc, info.PunchToken, []string{info.PeerPublicAddr, info.PeerLocalAddr}, c.dgramCipher)
 				if punchErr == nil {
 					c.metrics.P2PSuccesses.Add(1)
-					return &PeerChannel{
-						Mode:     "p2p",
-						Conn:     pc,
-						PeerAddr: peerAddr,
-					}, nil
+					return newPeerChannel("p2p", targetClientID, pc, peerAddr, "", c.dgramCipher), nil
 				}
 				c.log.Info("P2P punching failed, falling back to relay", "peer", targetClientID, "err", punchErr)
 			}
 		}
 	}
 
-	// Fallback to Server Relay
+	// Fallback to Server Relay. Skip the round-trip when the server advertised it as disabled.
+	c.mu.RLock()
+	relayEnabled, capsKnown := c.caps.RelayEnabled, c.capsKnown
+	c.mu.RUnlock()
+	if capsKnown && !relayEnabled {
+		closePC()
+		return nil, errors.New("server relay is disabled and P2P punching failed")
+	}
+
 	relayResp, err := c.sendRequest(ctx, protocol.MsgRelayAllocReq, message.RelayAllocReq{
 		TargetClientID: targetClientID,
 	})
 	if err != nil {
-		_ = pc.Close()
+		closePC()
 		return nil, fmt.Errorf("relay fallback failed: %w", err)
+	}
+	if relayResp.Header.Type == protocol.MsgError {
+		var em message.ErrorMsg
+		if codec.DecodeJSON(relayResp, &em) == nil {
+			closePC()
+			return nil, fmt.Errorf("relay allocation rejected (%d): %s", em.Code, em.Message)
+		}
 	}
 	var ack message.RelayAllocAck
 	if err := codec.DecodeJSON(relayResp, &ack); err != nil {
-		_ = pc.Close()
+		closePC()
 		return nil, err
 	}
 	if !ack.Success {
-		_ = pc.Close()
+		closePC()
 		return nil, fmt.Errorf("relay allocation denied: %s", ack.Error)
 	}
 	relayUDPAddr, err := net.ResolveUDPAddr("udp", ack.RelayAddr)
 	if err != nil {
-		_ = pc.Close()
+		closePC()
 		return nil, err
 	}
-	return &PeerChannel{
-		Mode:     "relay",
-		Conn:     pc,
-		PeerAddr: relayUDPAddr,
-		RelayID:  ack.RelaySessionID,
-	}, nil
-}
-
-// RelaySend wraps payload with the relay session header if ch.Mode == "relay" and writes it.
-func (ch *PeerChannel) Send(payload []byte) error {
-	data := payload
-	if ch.Mode == "relay" {
-		data = relaymgr.EncodeRelayPacket(ch.RelayID, payload)
-	}
-	_, err := ch.Conn.WriteTo(data, ch.PeerAddr)
-	return err
+	return newPeerChannel("relay", targetClientID, pc, relayUDPAddr, ack.RelaySessionID, c.dgramCipher), nil
 }
 
 func (c *Client) authenticate(conn net.Conn) (uint64, error) {
@@ -454,7 +659,56 @@ func (c *Client) authenticate(conn net.Conn) (uint64, error) {
 	if !resp.Success {
 		return 0, fmt.Errorf("authentication rejected (%d): %s", resp.ErrorCode, resp.Message)
 	}
+	c.mu.Lock()
+	c.caps = resp.Capabilities
+	c.capsKnown = resp.Capabilities.ProtocolVersion > 0
+	known := c.capsKnown
+	c.mu.Unlock()
+	if known {
+		c.log.Info("server capabilities",
+			"relay", c.caps.RelayEnabled, "relay_port", c.caps.RelayPort,
+			"nat", c.caps.NATEnabled, "nat_port", c.caps.NATPort,
+			"http_proxy", c.caps.HTTPProxyEnabled, "http_port", c.caps.HTTPProxyPort)
+	}
 	return resp.SessionID, nil
+}
+
+// natEndpoint returns the NAT discovery endpoint, preferring the live capability data.
+func (c *Client) natEndpoint() string {
+	c.mu.RLock()
+	port, known, enabled := c.cfg.Server.NATPort, c.capsKnown, c.caps.NATEnabled
+	c.mu.RUnlock()
+	if known && !enabled {
+		return ""
+	}
+	if known && c.caps.NATPort > 0 {
+		port = c.caps.NATPort
+	}
+	if port <= 0 {
+		return ""
+	}
+	return net.JoinHostPort(c.cfg.Server.Address, strconv.Itoa(port))
+}
+
+// ServerCapabilities returns the capabilities advertised by the server at authentication.
+// The second return value is false when connected to an older server without capability data.
+func (c *Client) ServerCapabilities() (message.ServerCapabilities, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.caps, c.capsKnown
+}
+
+// ServerInfo queries the live server for its capabilities and runtime metrics.
+func (c *Client) ServerInfo(ctx context.Context) (message.ServerInfo, error) {
+	resp, err := c.sendRequest(ctx, protocol.MsgInfoReq, struct{}{})
+	if err != nil {
+		return message.ServerInfo{}, err
+	}
+	var info message.ServerInfo
+	if err := codec.DecodeJSON(resp, &info); err != nil {
+		return message.ServerInfo{}, err
+	}
+	return info, nil
 }
 
 func (c *Client) sendRequest(ctx context.Context, msgType protocol.MessageType, payload any) (frame.Frame, error) {
@@ -541,7 +795,7 @@ func (c *Client) readLoop(ctx context.Context) error {
 func (c *Client) dispatchAsyncFrame(ctx context.Context, f frame.Frame) {
 	switch f.Header.Type {
 	case protocol.MsgHeartbeatPong:
-		// Heartbeat acknowledged.
+		c.lastPong.Store(time.Now().UnixNano())
 	case protocol.MsgTunnelOpenConn:
 		var req message.TunnelOpenConn
 		if err := codec.DecodeJSON(f, &req); err == nil {
@@ -567,6 +821,16 @@ func (c *Client) dispatchAsyncFrame(ctx context.Context, f frame.Frame) {
 		if err := codec.DecodeJSON(f, &info); err == nil {
 			go c.handleIncomingPeerConnect(ctx, info)
 		}
+	case protocol.MsgRelayAllocNotify:
+		var notify message.RelayAllocNotify
+		if err := codec.DecodeJSON(f, &notify); err == nil {
+			go c.handleIncomingRelay(notify)
+		}
+	case protocol.MsgError:
+		var em message.ErrorMsg
+		if err := codec.DecodeJSON(f, &em); err == nil {
+			c.log.Warn("server error", "code", em.Code, "message", em.Message)
+		}
 	}
 }
 
@@ -578,14 +842,34 @@ func (c *Client) handleIncomingPeerConnect(ctx context.Context, info message.Pee
 	if err != nil {
 		return
 	}
-	defer pc.Close()
-
-	peerAddr, err := punching.Punch(ctx, pc, info.PunchToken, []string{info.PeerPublicAddr, info.PeerLocalAddr})
+	peerAddr, err := punching.Punch(ctx, pc, info.PunchToken, []string{info.PeerPublicAddr, info.PeerLocalAddr}, c.dgramCipher)
 	if err != nil {
+		_ = pc.Close()
 		c.log.Debug("incoming P2P punch failed", "peer", info.PeerID, "err", err)
 		return
 	}
+	ch := newPeerChannel("p2p", info.PeerID, pc, peerAddr, "", c.dgramCipher)
+	c.RegisterIncoming(info.PeerID, ch)
 	c.log.Info("incoming P2P hole punch succeeded", "peer", info.PeerID, "peer_addr", peerAddr.String())
+}
+
+func (c *Client) handleIncomingRelay(notify message.RelayAllocNotify) {
+	if c.IncomingPeer(notify.FromClientID) != nil {
+		return
+	}
+	pc, err := net.ListenPacket("udp", ":0")
+	if err != nil {
+		return
+	}
+	relayAddr, err := net.ResolveUDPAddr("udp", notify.RelayAddr)
+	if err != nil {
+		_ = pc.Close()
+		return
+	}
+	ch := newPeerChannel("relay", notify.FromClientID, pc, relayAddr, notify.RelaySessionID, c.dgramCipher)
+	c.RegisterIncoming(notify.FromClientID, ch)
+	_ = ch.Send([]byte(peerRelayJoinPayload))
+	c.log.Info("joined relay session", "peer", notify.FromClientID, "relay", notify.RelaySessionID)
 }
 
 func (c *Client) handleOpenConn(ctx context.Context, req message.TunnelOpenConn) {
@@ -810,6 +1094,8 @@ func (c *Client) reapIdleUDP(ctx context.Context) {
 }
 
 func (c *Client) heartbeatLoop(ctx context.Context) {
+	// 以会话建立时刻作为初始基准，刚连上不会立刻误判。
+	c.lastPong.Store(time.Now().UnixNano())
 	ticker := time.NewTicker(heartbeatInterval)
 	defer ticker.Stop()
 	for {
@@ -817,6 +1103,11 @@ func (c *Client) heartbeatLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			if pongStale(c.lastPong.Load(), time.Now()) {
+				c.log.Warn("heartbeat timeout, closing stale session", "client_id", c.cfg.Client.ID)
+				c.closeStaleConn()
+				return // readLoop 读到关闭错误 -> Run 重连
+			}
 			c.mu.RLock()
 			sessID := c.sessionID
 			c.mu.RUnlock()
@@ -828,6 +1119,37 @@ func (c *Client) heartbeatLoop(ctx context.Context) {
 			}
 		}
 	}
+}
+
+// pongStale 判定最近一次 PONG 是否已超过容忍窗口。
+func pongStale(lastPongUnixNano int64, now time.Time) bool {
+	if lastPongUnixNano <= 0 {
+		return false // 尚未认证，交由上层处理
+	}
+	return now.Sub(time.Unix(0, lastPongUnixNano)) > heartbeatInterval*missedPongLimit
+}
+
+// closeStaleConn 关闭当前控制连接，使 readLoop 返回并触发上层重连。
+func (c *Client) closeStaleConn() {
+	c.mu.RLock()
+	conn := c.conn
+	c.mu.RUnlock()
+	if conn != nil {
+		_ = conn.Close()
+	}
+}
+
+// Connected reports whether the control session has a fresh heartbeat acknowledgement.
+// 半开链路上读循环可能尚未报错，但收不到 PONG 时这里会返回 false。
+func (c *Client) Connected() bool {
+	c.mu.RLock()
+	conn := c.conn
+	c.mu.RUnlock()
+	if conn == nil {
+		return false
+	}
+	lp := c.lastPong.Load()
+	return lp > 0 && time.Since(time.Unix(0, lp)) <= heartbeatInterval*missedPongLimit
 }
 
 func (c *Client) cleanupSession() {
@@ -855,4 +1177,11 @@ func (c *Client) cleanupSession() {
 		delete(c.udpPeers, k)
 	}
 	c.udpMu.Unlock()
+
+	c.peerMu.Lock()
+	for id, ch := range c.incoming {
+		delete(c.incoming, id)
+		_ = ch.Close()
+	}
+	c.peerMu.Unlock()
 }

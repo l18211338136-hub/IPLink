@@ -17,3 +17,6 @@ configs/*.json
 .vscode/
 .DS_Store
 Thumbs.db
+
+# WorkBuddy workspace data
+.workbuddy/

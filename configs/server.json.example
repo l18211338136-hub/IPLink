@@ -17,6 +17,10 @@
     "max_sessions": 1000,
     "max_bytes_per_sec": 0
   },
+  "metrics": {
+    "enabled": true,
+    "port": 29100
+  },
   "logging": {
     "level": "info",
     "format": "json"

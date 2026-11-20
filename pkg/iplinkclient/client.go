@@ -9,6 +9,7 @@ import (
 	"iplink/internal/client/service"
 	"iplink/internal/config"
 	"iplink/internal/logger"
+	"iplink/internal/protocol/message"
 )
 
 // Config aliases the IPLink client configuration.
@@ -19,6 +20,15 @@ type TunnelConfig = config.TunnelConfig
 
 // ActiveTunnel aliases a runtime registered tunnel.
 type ActiveTunnel = service.ActiveTunnel
+
+// ServerCapabilities aliases the capabilities advertised by the server.
+type ServerCapabilities = message.ServerCapabilities
+
+// ServerInfo aliases the live server capabilities and metrics snapshot.
+type ServerInfo = message.ServerInfo
+
+// PeerChannel aliases a P2P or Relay channel established with another client.
+type PeerChannel = service.PeerChannel
 
 // DefaultConfig returns a ClientConfig with sensible defaults.
 func DefaultConfig() Config {
@@ -68,4 +78,34 @@ func (c *Client) Run(ctx context.Context) error {
 // ActiveTunnels returns the currently registered tunnels.
 func (c *Client) ActiveTunnels() []ActiveTunnel {
 	return c.svc.ActiveTunnels()
+}
+
+// Connected reports whether the control session is alive (fresh heartbeat acknowledgement).
+func (c *Client) Connected() bool {
+	return c.svc.Connected()
+}
+
+// ServerCapabilities returns what the connected server advertised at authentication.
+func (c *Client) ServerCapabilities() (ServerCapabilities, bool) {
+	return c.svc.ServerCapabilities()
+}
+
+// ServerInfo queries the live server for capabilities and runtime metrics.
+func (c *Client) ServerInfo(ctx context.Context) (ServerInfo, error) {
+	return c.svc.ServerInfo(ctx)
+}
+
+// ListPeers returns the clients currently online on the server.
+func (c *Client) ListPeers(ctx context.Context) ([]message.PeerInfo, error) {
+	return c.svc.ListPeers(ctx)
+}
+
+// ConnectPeer opens a direct or relayed channel to another client.
+func (c *Client) ConnectPeer(ctx context.Context, targetClientID string) (*PeerChannel, error) {
+	return c.svc.ConnectPeer(ctx, targetClientID)
+}
+
+// IncomingPeer returns the channel opened by a remote peer, if any.
+func (c *Client) IncomingPeer(peerID string) *PeerChannel {
+	return c.svc.IncomingPeer(peerID)
 }

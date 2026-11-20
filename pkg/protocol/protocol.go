@@ -3,7 +3,9 @@ package protocol
 import "errors"
 
 // ProtocolVersion is the current wire protocol version, independent of software version.
-const ProtocolVersion uint16 = 1
+// v2: UDP datagrams (NAT discovery, P2P punching, peer channels, relay payloads)
+// are encrypted with AES-256-GCM keyed from the shared token.
+const ProtocolVersion uint16 = 2
 
 // HeaderSize is the fixed byte length of MessageHeader on the wire.
 const HeaderSize = 26
@@ -40,8 +42,12 @@ const (
 	MsgPeerConnectReq  MessageType = 0x0034
 	MsgPeerConnectInfo MessageType = 0x0035
 
-	MsgRelayAllocReq MessageType = 0x0040
-	MsgRelayAllocAck MessageType = 0x0041
+	MsgRelayAllocReq    MessageType = 0x0040
+	MsgRelayAllocAck    MessageType = 0x0041
+	MsgRelayAllocNotify MessageType = 0x0042
+
+	MsgInfoReq  MessageType = 0x0043
+	MsgInfoResp MessageType = 0x0044
 
 	MsgError MessageType = 0x00FF
 )

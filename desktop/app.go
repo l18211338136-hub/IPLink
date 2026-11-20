@@ -130,11 +130,12 @@ func (a *App) Connect(cfg iplinkclient.Config) error {
 		expanded.Server.Address, expanded.Server.Port, expanded.Client.ID))
 	a.emitStatus()
 
-	go a.pollStatusLoop(runCtx)
+	go a.pollStatusLoop(runCtx, cli)
 
 	go func() {
 		defer close(done)
 		err := cli.Run(runCtx)
+		cancel() // 停止状态轮询，避免 goroutine 泄漏
 
 		a.mu.Lock()
 		a.cancelRun = nil
@@ -317,30 +318,9 @@ func (a *App) Write(p []byte) (int, error) {
 	a.logMu.Unlock()
 
 	for _, line := range lines {
-		a.updateStateFromLog(line)
 		a.appendLog(line)
 	}
 	return len(p), nil
-}
-
-func (a *App) updateStateFromLog(line string) {
-	var changed bool
-	a.mu.Lock()
-	if a.cancelRun != nil {
-		switch {
-		case strings.Contains(line, "connected to IPLink server") && a.state != "connected":
-			a.state = "connected"
-			a.lastErr = ""
-			changed = true
-		case strings.Contains(line, "client disconnected") && a.state != "reconnecting":
-			a.state = "reconnecting"
-			changed = true
-		}
-	}
-	a.mu.Unlock()
-	if changed {
-		a.emitStatus()
-	}
 }
 
 func (a *App) appendLog(line string) {
@@ -362,7 +342,7 @@ func (a *App) emitStatus() {
 	}
 }
 
-func (a *App) pollStatusLoop(ctx context.Context) {
+func (a *App) pollStatusLoop(ctx context.Context, cli *iplinkclient.Client) {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 	for {
@@ -370,6 +350,21 @@ func (a *App) pollStatusLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			// 状态由实时连接健康度决定，不再靠匹配日志文本。
+			alive := cli.Connected()
+			a.mu.Lock()
+			if a.client == cli && a.cancelRun != nil {
+				switch {
+				case alive:
+					if a.state != "connected" {
+						a.state = "connected"
+						a.lastErr = ""
+					}
+				case a.state == "connected":
+					a.state = "reconnecting"
+				}
+			}
+			a.mu.Unlock()
 			a.emitStatus()
 		}
 	}

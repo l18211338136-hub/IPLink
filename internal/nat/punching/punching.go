@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"net"
 	"time"
+
+	dgramcrypto "iplink/internal/security/crypto"
 )
 
 const (
@@ -16,9 +18,15 @@ const (
 
 var ErrPunchTimeout = errors.New("nat: UDP hole punching timed out")
 
+// IsPunchPacket reports whether payload is a punch probe or ACK from the handshake.
+func IsPunchPacket(payload []byte) bool {
+	return bytes.HasPrefix(payload, []byte(punchPrefix)) || bytes.HasPrefix(payload, []byte(punchAckPrefix))
+}
+
 // Punch attempts direct UDP hole punching on pc toward candidateAddrs using punchToken.
+// Punch probes/ACKs are encrypted with cipher so the shared token is never sent in cleartext.
 // On success, it returns the verified peer *net.UDPAddr. On failure, callers must fall back to Relay.
-func Punch(ctx context.Context, pc net.PacketConn, punchToken string, candidateAddrs []string) (*net.UDPAddr, error) {
+func Punch(ctx context.Context, pc net.PacketConn, punchToken string, candidateAddrs []string, cipher *dgramcrypto.DatagramCipher) (*net.UDPAddr, error) {
 	if pc == nil {
 		return nil, errors.New("nat: PacketConn is nil")
 	}
@@ -36,8 +44,8 @@ func Punch(ctx context.Context, pc net.PacketConn, punchToken string, candidateA
 		return nil, errors.New("nat: no valid candidate addresses for punching")
 	}
 
-	punchMsg := []byte(punchPrefix + punchToken)
-	ackMsg := []byte(punchAckPrefix + punchToken)
+	punchMsg := cipher.Seal([]byte(punchPrefix + punchToken))
+	ackMsg := cipher.Seal([]byte(punchAckPrefix + punchToken))
 
 	punchCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
@@ -78,8 +86,11 @@ func Punch(ctx context.Context, pc net.PacketConn, punchToken string, candidateA
 			_ = pc.SetReadDeadline(time.Time{})
 			return nil, fmt.Errorf("nat punch read: %w", err)
 		}
-		payload := buf[:n]
-		if bytes.Equal(payload, punchMsg) {
+		plain, err := cipher.Open(buf[:n])
+		if err != nil {
+			continue // 非本通道密文或篡改包，忽略
+		}
+		if bytes.HasPrefix(plain, []byte(punchPrefix)) && bytes.Equal(plain[len(punchPrefix):], []byte(punchToken)) {
 			// Peer punch received: send ack and return verified peer address.
 			_, _ = pc.WriteTo(ackMsg, addr)
 			_ = pc.SetReadDeadline(time.Time{})
@@ -88,7 +99,7 @@ func Punch(ctx context.Context, pc net.PacketConn, punchToken string, candidateA
 			}
 			return net.ResolveUDPAddr("udp", addr.String())
 		}
-		if bytes.Equal(payload, ackMsg) {
+		if bytes.HasPrefix(plain, []byte(punchAckPrefix)) && bytes.Equal(plain[len(punchAckPrefix):], []byte(punchToken)) {
 			_ = pc.SetReadDeadline(time.Time{})
 			if ua, ok := addr.(*net.UDPAddr); ok {
 				return ua, nil

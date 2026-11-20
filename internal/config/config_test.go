@@ -42,6 +42,47 @@ func TestLoadServerAndClientConfig(t *testing.T) {
 	}
 }
 
+func TestServerConfigMetricsPortValidation(t *testing.T) {
+	base := func() ServerConfig {
+		cfg := DefaultServerConfig()
+		cfg.Security.Token = "tok"
+		return cfg
+	}
+
+	t.Run("port zero is dynamic allocation", func(t *testing.T) {
+		cfg := base()
+		cfg.Metrics.Port = 0
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("metrics.port=0 should be allowed: %v", err)
+		}
+	})
+
+	t.Run("collision with server port rejected", func(t *testing.T) {
+		cfg := base()
+		cfg.Metrics.Port = cfg.Server.ControlPort
+		if err := cfg.Validate(); err == nil {
+			t.Fatal("expected metrics port collision to be rejected")
+		}
+	})
+
+	t.Run("invalid port rejected", func(t *testing.T) {
+		cfg := base()
+		cfg.Metrics.Port = 70000
+		if err := cfg.Validate(); err == nil {
+			t.Fatal("expected invalid metrics port to be rejected")
+		}
+	})
+
+	t.Run("disabled skips port validation", func(t *testing.T) {
+		cfg := base()
+		cfg.Metrics.Enabled = false
+		cfg.Metrics.Port = -1
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("disabled metrics should skip port validation: %v", err)
+		}
+	})
+}
+
 func TestClientConfigRejectsDomainName(t *testing.T) {
 	cfg := DefaultClientConfig()
 	cfg.Client.ID = "c1"

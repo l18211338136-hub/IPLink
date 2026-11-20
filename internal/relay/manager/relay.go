@@ -31,6 +31,46 @@ type relaySession struct {
 	lastActive time.Time
 }
 
+// tokenBucket 是一个简单的字节令牌桶，用于 Relay 出口限速。
+// capacity 至少能容纳一个最大 UDP 包，避免低速率下单个包永远无法通过。
+type tokenBucket struct {
+	mu       sync.Mutex
+	rate     float64
+	capacity float64
+	tokens   float64
+	last     time.Time
+}
+
+func newTokenBucket(bytesPerSec int64) *tokenBucket {
+	if bytesPerSec <= 0 {
+		return nil // 不限速
+	}
+	cap := float64(bytesPerSec)
+	if cap < protocol.MaxUDPPacketSize {
+		cap = protocol.MaxUDPPacketSize
+	}
+	return &tokenBucket{rate: float64(bytesPerSec), capacity: cap, tokens: cap, last: time.Now()}
+}
+
+func (b *tokenBucket) allow(n int) bool {
+	if b == nil {
+		return true
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	now := time.Now()
+	b.tokens += now.Sub(b.last).Seconds() * b.rate
+	if b.tokens > b.capacity {
+		b.tokens = b.capacity
+	}
+	b.last = now
+	if b.tokens >= float64(n) {
+		b.tokens -= float64(n)
+		return true
+	}
+	return false
+}
+
 // Manager handles UDP relay session allocation, packet forwarding, and idle cleanup.
 type Manager struct {
 	enabled     bool
@@ -38,6 +78,7 @@ type Manager struct {
 	conn        net.PacketConn
 	metrics     *metrics.Metrics
 	log         *slog.Logger
+	limiter     *tokenBucket // nil 表示不限速
 
 	mu       sync.RWMutex
 	sessions map[string]*relaySession
@@ -45,12 +86,13 @@ type Manager struct {
 }
 
 // Start starts the UDP relay listener on addr if enabled.
-func Start(ctx context.Context, addr string, enabled bool, maxSessions int, m *metrics.Metrics, log *slog.Logger) (*Manager, error) {
+func Start(ctx context.Context, addr string, enabled bool, maxSessions int, maxBytesPerSec int64, m *metrics.Metrics, log *slog.Logger) (*Manager, error) {
 	mgr := &Manager{
 		enabled:     enabled,
 		maxSessions: maxSessions,
 		metrics:     m,
 		log:         log,
+		limiter:     newTokenBucket(maxBytesPerSec),
 		sessions:    make(map[string]*relaySession),
 	}
 	if !enabled {
@@ -118,6 +160,14 @@ func EncodeRelayPacket(sessionID string, payload []byte) []byte {
 	return pkt
 }
 
+// DecodeRelayPacket splits a received relay packet into its session ID and payload.
+func DecodeRelayPacket(pkt []byte) (string, []byte, error) {
+	if len(pkt) <= relayHeaderLen {
+		return "", nil, errors.New("relay: packet shorter than header")
+	}
+	return trimZeroRight(pkt[:relayHeaderLen]), pkt[relayHeaderLen:], nil
+}
+
 func (m *Manager) serve(ctx context.Context) {
 	defer m.conn.Close()
 	go func() {
@@ -140,6 +190,11 @@ func (m *Manager) serve(ctx context.Context) {
 		}
 		sid := trimZeroRight(buf[:relayHeaderLen])
 		payload := buf[relayHeaderLen:n]
+
+		if !m.limiter.allow(len(payload)) {
+			m.log.Debug("relay packet dropped by rate limit", "session", sid, "bytes", len(payload))
+			continue
+		}
 
 		dst := m.bindAndLookupPeer(sid, srcAddr)
 		if dst == nil {

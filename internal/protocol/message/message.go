@@ -1,6 +1,9 @@
 package message
 
-import "iplink/pkg/protocol"
+import (
+	"iplink/internal/metrics"
+	"iplink/pkg/protocol"
+)
 
 // AuthChallenge is sent by the server immediately upon TCP connection.
 type AuthChallenge struct {
@@ -17,12 +20,33 @@ type AuthRequest struct {
 	LocalAddr string `json:"local_addr,omitempty"`
 }
 
+// ServerCapabilities advertises which optional services the server actually bound.
+// Ports come from the live listeners so dynamically assigned ports are reported correctly.
+type ServerCapabilities struct {
+	ProtocolVersion  uint16 `json:"protocol_version"`
+	RelayEnabled     bool   `json:"relay_enabled"`
+	RelayPort        int    `json:"relay_port,omitempty"`
+	NATEnabled       bool   `json:"nat_enabled"`
+	NATPort          int    `json:"nat_port,omitempty"`
+	HTTPProxyEnabled bool   `json:"http_proxy_enabled"`
+	HTTPProxyPort    int    `json:"http_proxy_port,omitempty"`
+	MetricsEnabled   bool   `json:"metrics_enabled"`
+	MetricsPort      int    `json:"metrics_port,omitempty"`
+}
+
+// ServerInfo is the response to an on-demand runtime query.
+type ServerInfo struct {
+	Capabilities ServerCapabilities `json:"capabilities"`
+	Metrics      metrics.Snapshot   `json:"metrics"`
+}
+
 // AuthResponse acknowledges client authentication and assigns a numeric SessionID.
 type AuthResponse struct {
-	Success   bool               `json:"success"`
-	SessionID uint64             `json:"session_id"`
-	ErrorCode protocol.ErrorCode `json:"error_code,omitempty"`
-	Message   string             `json:"message,omitempty"`
+	Success      bool               `json:"success"`
+	SessionID    uint64             `json:"session_id"`
+	ErrorCode    protocol.ErrorCode `json:"error_code,omitempty"`
+	Message      string             `json:"message,omitempty"`
+	Capabilities ServerCapabilities `json:"capabilities,omitempty"`
 }
 
 // HeartbeatPing / HeartbeatPong keep control sessions alive.
@@ -136,6 +160,13 @@ type RelayAllocAck struct {
 	RelayAddr      string             `json:"relay_addr,omitempty"`
 	ErrorCode      protocol.ErrorCode `json:"error_code,omitempty"`
 	Error          string             `json:"error,omitempty"`
+}
+
+// RelayAllocNotify tells the target client that a peer opened a relay session.
+type RelayAllocNotify struct {
+	FromClientID   string `json:"from_client_id"`
+	RelaySessionID string `json:"relay_session_id"`
+	RelayAddr      string `json:"relay_addr"`
 }
 
 // ErrorMsg conveys a protocol-level error.

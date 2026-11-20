@@ -17,7 +17,7 @@ import (
 	"iplink/internal/config"
 	"iplink/internal/logger"
 	"iplink/internal/nat/discovery"
-	relaymgr "iplink/internal/relay/manager"
+	dgramcrypto "iplink/internal/security/crypto"
 	serverservice "iplink/internal/server/service"
 )
 
@@ -28,6 +28,7 @@ func startTestServer(t *testing.T, token string) (*serverservice.Server, int, in
 	srvCfg.Server.ControlPort = 0
 	srvCfg.Server.RelayPort = 0
 	srvCfg.Server.NATPort = 0
+	srvCfg.Metrics.Port = 0 // 动态分配，避免测试间端口冲突
 	srvCfg.Security.Token = token
 
 	log := logger.New("warn", "text", io.Discard)
@@ -217,7 +218,11 @@ func TestEndToEndTCPAndUDPTunnels(t *testing.T) {
 	}
 
 	// 7. Verify NAT public address discovery.
-	pub, err := discovery.DiscoverPublicAddr(cliCtx, nil, srv.NATAddr(), "client-a", "nonce-1")
+	natCipher, err := dgramcrypto.NewDatagramCipher(token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub, err := discovery.DiscoverPublicAddr(cliCtx, nil, srv.NATAddr(), "client-a", "nonce-1", natCipher)
 	if err != nil {
 		t.Fatalf("DiscoverPublicAddr: %v", err)
 	}
@@ -257,32 +262,18 @@ func TestEndToEndTCPAndUDPTunnels(t *testing.T) {
 		t.Fatalf("expected relay mode when P2P disabled, got %q", ch.Mode)
 	}
 
-	// Second peer joins the same relay session and exchanges a message.
-	peerAJoin, err := net.ListenPacket("udp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer peerAJoin.Close()
+	// The server notifies client-a, which joins the same relay session automatically.
+	peerACh := waitIncomingPeer(t, cli, "client-b")
+	defer peerACh.Close()
 
-	relayAddr, err := net.ResolveUDPAddr("udp", srv.RelayAddr())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := peerAJoin.WriteTo(relaymgr.EncodeRelayPacket(ch.RelayID, []byte("init")), relayAddr); err != nil {
-		t.Fatal(err)
-	}
 	if err := ch.Send([]byte("relay-ping")); err != nil {
 		t.Fatal(err)
 	}
-
-	_ = peerAJoin.SetReadDeadline(time.Now().Add(2 * time.Second))
-	rbuf := make([]byte, 1024)
-	rn, _, err := peerAJoin.ReadFrom(rbuf)
-	if err != nil {
-		t.Fatalf("peerAJoin read relay packet: %v", err)
-	}
-	if !bytes.HasSuffix(rbuf[:rn], []byte("relay-ping")) {
-		t.Fatalf("unexpected relay payload: %q", rbuf[:rn])
+	recvCtx, cancelRecv := context.WithTimeout(cliCtx, 2*time.Second)
+	defer cancelRecv()
+	got, err := peerACh.Receive(recvCtx)
+	if err != nil || !bytes.Equal(got, []byte("relay-ping")) {
+		t.Fatalf("relay payload = %q, err = %v", got, err)
 	}
 }
 
@@ -400,6 +391,7 @@ func TestHTTPReverseProxyMultiRoutes(t *testing.T) {
 	srvCfg.Server.RelayPort = 0
 	srvCfg.Server.NATPort = 0
 	srvCfg.Server.HTTPProxyPort = httpPort
+	srvCfg.Metrics.Port = 0 // 动态分配，避免测试间端口冲突
 	srvCfg.Security.Token = token
 
 	srv := serverservice.New(srvCfg, logger.New("warn", "text", io.Discard))
