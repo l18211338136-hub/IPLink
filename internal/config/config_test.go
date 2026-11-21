@@ -87,6 +87,9 @@ func TestServerConfigMetricsPortValidation(t *testing.T) {
 		if cfg.Metrics.ListenIP != "127.0.0.1" {
 			t.Fatalf("default metrics.listen_ip = %q, want 127.0.0.1", cfg.Metrics.ListenIP)
 		}
+		if cfg.Metrics.AllowQueryToken {
+			t.Fatal("metrics.allow_query_token must default to false")
+		}
 		if err := cfg.Validate(); err != nil {
 			t.Fatalf("default config should validate: %v", err)
 		}

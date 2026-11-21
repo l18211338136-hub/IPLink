@@ -138,14 +138,30 @@ func TestHandlerRequiresToken(t *testing.T) {
 		t.Fatalf("bearer status = %d, want 200", resp.StatusCode)
 	}
 
-	// Query token -> 200.
+	// Query token is rejected by default.
 	resp, err = http.Get(ts.URL + "/metrics/json?token=" + token)
 	if err != nil {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("query-token status = %d, want 401", resp.StatusCode)
+	}
+}
+
+func TestHandlerQueryTokenOptIn(t *testing.T) {
+	m := &Metrics{}
+	const token = "legacy-token"
+	ts := httptest.NewServer(HandlerWithOptions(m, token, true))
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/metrics?token=" + token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("query-token status = %d, want 200", resp.StatusCode)
+		t.Fatalf("opt-in query-token status = %d, want 200", resp.StatusCode)
 	}
 }
 

@@ -12,16 +12,24 @@ import (
 // GET /metrics      -> Prometheus text exposition format
 // GET /metrics/json -> JSON Snapshot
 //
-// If token is non-empty, requests must authenticate either with
-// "Authorization: Bearer <token>" or "?token=<token>". An empty token
-// disables authentication (intended for loopback-only deployments).
+// If token is non-empty, requests must authenticate with
+// "Authorization: Bearer <token>". Query tokens are rejected by default;
+// use HandlerWithOptions to opt in. An empty token disables authentication
+// (intended for loopback-only deployments).
 func Handler(m *Metrics, token ...string) http.Handler {
 	expected := ""
 	if len(token) > 0 {
 		expected = token[0]
 	}
+	return HandlerWithOptions(m, expected, false)
+}
+
+// HandlerWithOptions exposes metrics with explicit query-token policy.
+// allowQueryToken is off by default because tokens in URLs leak into logs and
+// browser history; enable it only for legacy Prometheus params compatibility.
+func HandlerWithOptions(m *Metrics, token string, allowQueryToken bool) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if expected != "" && !metricsAuthenticated(r, expected) {
+		if token != "" && !metricsAuthenticated(r, token, allowQueryToken) {
 			w.Header().Set("WWW-Authenticate", `Bearer realm="iplink-metrics"`)
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
@@ -46,14 +54,17 @@ func Handler(m *Metrics, token ...string) http.Handler {
 }
 
 // metricsAuthenticated reports whether r carries the expected metrics token.
-// It accepts "Authorization: Bearer <token>" or "?token=<token>".
-func metricsAuthenticated(r *http.Request, expected string) bool {
+// Bearer headers are always accepted; "?token=" only when explicitly allowed.
+func metricsAuthenticated(r *http.Request, expected string, allowQueryToken bool) bool {
 	if auth := r.Header.Get("Authorization"); auth != "" {
 		parts := strings.Fields(auth)
 		if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") {
 			return false
 		}
 		return subtle.ConstantTimeCompare([]byte(parts[1]), []byte(expected)) == 1
+	}
+	if !allowQueryToken {
+		return false
 	}
 	return subtle.ConstantTimeCompare([]byte(r.URL.Query().Get("token")), []byte(expected)) == 1
 }

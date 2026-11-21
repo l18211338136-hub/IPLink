@@ -153,6 +153,39 @@ func TestServerAllowedTargetsDeniesOutOfPolicy(t *testing.T) {
 	}
 }
 
+func TestServerAllowedTargetsEmptyDefaultsToLoopback(t *testing.T) {
+	const token = "default-allowlist-secret"
+	ctrlPort, stopSrv := startPolicyServer(t, token, nil)
+	defer stopSrv()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cli := policyClient(t, token, ctrlPort, "default-allowlist-client", func(cfg *config.ClientConfig) {
+		// 放宽客户端白名单，确保拒绝来自服务端默认策略。
+		cfg.Security.AllowedTargets = []string{"*:*"}
+	})
+	done, err := cli.Start(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { cancel(); <-done }()
+
+	_, err = cli.RegisterTunnel(ctx, config.TunnelConfig{
+		Name: "denied", Protocol: "tcp", LocalAddr: "10.1.2.3:8080", RemoteAddr: "127.0.0.1:0",
+	})
+	if err == nil || !strings.Contains(err.Error(), "not permitted") {
+		t.Fatalf("empty allowed_targets must deny non-loopback target, got %v", err)
+	}
+
+	_, err = cli.RegisterTunnel(ctx, config.TunnelConfig{
+		Name: "allowed", Protocol: "tcp", LocalAddr: "127.0.0.1:8080", RemoteAddr: "127.0.0.1:0",
+	})
+	if err != nil {
+		t.Fatalf("loopback target should be allowed by default: %v", err)
+	}
+}
+
 func TestConnectedFalseAfterDisconnect(t *testing.T) {
 	const token = "connected-secret"
 	_, ctrlPort, _, natPort, stopSrv := startTestServer(t, token)

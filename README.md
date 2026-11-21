@@ -105,12 +105,13 @@ export IPLINK_TOKEN="your-strong-secret-token"
 
 服务端默认在 `127.0.0.1:29100` 暴露运行时指标（仅本机可访问），可通过 `metrics.listen_ip` / `metrics.port` 修改，端口设为 `0` 动态分配，`metrics.enabled=false` 关闭。默认配置无需鉴权——因为只绑 loopback。
 
-**要将指标端点暴露到非本机地址，必须设置 `metrics.token`**（否则配置校验会拒绝启动）。设置后请求需携带该 token，支持两种方式：
+**要将指标端点暴露到非本机地址，必须设置 `metrics.token`**（否则配置校验会拒绝启动）。设置后请求默认只接受 Bearer header：
 
 ```bash
-curl -H "Authorization: Bearer <token>" http://<server-ip>:29100/metrics   # 推荐
-curl "http://<server-ip>:29100/metrics/json?token=<token>"                 # Prometheus 可用 ?token=
+curl -H "Authorization: Bearer <token>" http://<server-ip>:29100/metrics
 ```
+
+`?token=<token>` 查询参数默认被拒绝，避免 token 进入访问日志与浏览器历史。仅当旧版 Prometheus 必须使用 `params` 时，才显式设置 `metrics.allow_query_token: true` 开启兼容模式。
 
 Prometheus 抓取配置示例：
 
@@ -136,9 +137,9 @@ scrape_configs:
 ### 7. 配置开关说明
 
 - **客户端 `network.enable_tcp` / `enable_udp`**：为 `false` 时跳过对应协议的隧道注册（HTTP 隧道归入 TCP），不影响其它隧道与连接本身。
-- **服务端 `security.allowed_targets`**：显式配置后，服务端会对客户端注册的每个 `local_addr` 做白名单校验（支持 IP / CIDR / 端口，如 `10.0.0.0/8:8080`），防止服务端被当作开放代理。留空则不限制，保持内网任意目标转发的兼容性。
+- **服务端 `security.allowed_targets`**：服务端始终对客户端注册的每个 `local_addr` 做白名单校验（支持 IP / CIDR / 端口，如 `10.0.0.0/8:8080`）。留空时默认仅允许 loopback（`127.0.0.1:*`、`[::1]:*`），与客户端默认策略一致；需要任意目标时必须显式配置 `"*:*"`。
 - **服务端 `relay.max_bytes_per_sec`**：Relay 出口字节速率上限，超出的 UDP 数据报会被丢弃；`0` 或负数表示不限速。
-- **服务端 `metrics.enabled` / `metrics.port` / `metrics.listen_ip` / `metrics.token`**：内置指标端点开关、端口（默认 `29100`）、监听 IP（默认 `127.0.0.1`）与访问 token。端口需与其它服务端口互不相同，`0` 表示动态分配；监听非 loopback 地址时 `token` 必填，请求通过 `Authorization: Bearer` 或 `?token=` 携带。
+- **服务端 `metrics.enabled` / `metrics.port` / `metrics.listen_ip` / `metrics.token` / `metrics.allow_query_token`**：内置指标端点开关、端口（默认 `29100`）、监听 IP（默认 `127.0.0.1`）、访问 token 与查询参数兼容开关（默认 `false`）。端口需与其它服务端口互不相同，`0` 表示动态分配；监听非 loopback 地址时 `token` 必填，请求默认只接受 `Authorization: Bearer`。
 
 ## 测试
 

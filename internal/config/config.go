@@ -20,10 +20,11 @@ type ServerConfig struct {
 
 // MetricsConfig configures the built-in Prometheus/JSON metrics endpoint.
 type MetricsConfig struct {
-	Enabled  bool   `json:"enabled"`
-	Port     int    `json:"port"`
-	ListenIP string `json:"listen_ip,omitempty"` // defaults to 127.0.0.1 (loopback only)
-	Token    string `json:"token,omitempty"`     // if set, requests must present this token
+	Enabled         bool   `json:"enabled"`
+	Port            int    `json:"port"`
+	ListenIP        string `json:"listen_ip,omitempty"`         // defaults to 127.0.0.1 (loopback only)
+	Token           string `json:"token,omitempty"`             // if set, requests must present this token
+	AllowQueryToken bool   `json:"allow_query_token,omitempty"` // opt-in: accept ?token= (leaks in logs)
 }
 
 // ServerListenConfig configures the server listening addresses and ports.
@@ -123,7 +124,7 @@ func DefaultServerConfig() ServerConfig {
 			Enabled:  true,
 			Port:     29100,
 			ListenIP: "127.0.0.1",
-		},
+		}, // AllowQueryToken defaults to false
 		Logging: LoggingConfig{
 			Level:  "info",
 			Format: "text",

@@ -56,6 +56,9 @@ func (s *Server) startHTTPProxy(ctx context.Context, tlsConfig *tls.Config) erro
 	s.httpSrv = &http.Server{
 		Handler:           http.HandlerFunc(s.serveHTTPProxy),
 		ReadHeaderTimeout: 15 * time.Second,
+		ReadTimeout:       60 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20,
 	}
 
 	s.wg.Add(1)
@@ -88,7 +91,7 @@ func (s *Server) startMetrics(tlsConfig *tls.Config) error {
 	}
 	s.metricsLn = ln
 	s.metricsSrv = &http.Server{
-		Handler:           metrics.Handler(s.metrics, s.cfg.Metrics.Token),
+		Handler:           metrics.HandlerWithOptions(s.metrics, s.cfg.Metrics.Token, s.cfg.Metrics.AllowQueryToken),
 		ReadHeaderTimeout: 15 * time.Second,
 	}
 
@@ -142,13 +145,21 @@ func (s *Server) registerHTTPRoute(ctx context.Context, sess *session.Session, t
 			return s.dialTunnelStream(ctx, dialCtx, route)
 		},
 		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   20,
+		MaxConnsPerHost:       100,
 		IdleConnTimeout:       60 * time.Second,
 		ResponseHeaderTimeout: 30 * time.Second,
 	}
 	route.proxy = &httputil.ReverseProxy{
+		// Negative value flushes immediately after each write, keeping SSE and
+		// chunked responses responsive even when Content-Length is known.
+		FlushInterval: -1,
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			pr.Out.URL.Scheme = "http"
 			pr.Out.URL.Host = route.localAddr
+			// Backends doing Host-based virtual hosting must see the real local
+			// target instead of the public proxy host.
+			pr.Out.Host = route.localAddr
 			if route.stripPrefix && route.prefix != "/" {
 				trimmed := strings.TrimPrefix(pr.In.URL.Path, route.prefix)
 				if trimmed == "" {

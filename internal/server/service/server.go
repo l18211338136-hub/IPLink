@@ -48,8 +48,8 @@ type Server struct {
 	natSrv   *discovery.Server
 	relayMgr *relaymgr.Manager
 
-	// 为空表示服务端未设置白名单，不限制客户端目标地址；
-	// 非空时按规则校验 req.LocalAddr，防止服务端被当作开放代理。
+	// 始终按白名单校验 req.LocalAddr；空配置等同于 loopback-only。
+	// 需要任意目标时须显式配置 "*:*"。
 	targetValidator *identity.TargetValidator
 	targetErr       error
 
@@ -104,10 +104,9 @@ func New(cfg config.ServerConfig, log *slog.Logger) *Server {
 		udpPeers:   make(map[string]map[string]time.Time),
 		httpRoutes: make(map[string]*httpRoute),
 	}
-	if len(cfg.Security.AllowedTargets) > 0 {
-		// 显式配置白名单时才构造；空配置保持"不限制"以兼容内网转发场景。
-		s.targetValidator, s.targetErr = identity.NewTargetValidator(cfg.Security.AllowedTargets)
-	}
+	// NewTargetValidator treats an empty list as loopback-only, matching the
+	// client-side default. Explicit "*:*" is required for unrestricted targets.
+	s.targetValidator, s.targetErr = identity.NewTargetValidator(cfg.Security.AllowedTargets)
 	return s
 }
 
@@ -510,13 +509,18 @@ func (s *Server) handleTunnelCreate(ctx context.Context, sess *session.Session, 
 			s.sendTunnelCreateErr(sess, reqID, protocol.ErrTunnelCreateFailed, err.Error())
 			return
 		}
+		var cleanupOnce sync.Once
+		cleanup := func() error {
+			cleanupOnce.Do(func() {
+				s.metrics.ActiveTunnels.Add(-1)
+				s.metrics.UnregisterTunnel(tunID)
+				_ = ln.Close()
+			})
+			return nil
+		}
 		s.metrics.ActiveTunnels.Add(1)
 		s.metrics.RegisterTunnel(tunID, "tcp", req.LocalAddr)
-		sess.RegisterTunnel(tunID, closerFunc(func() error {
-			s.metrics.ActiveTunnels.Add(-1)
-			s.metrics.UnregisterTunnel(tunID)
-			return ln.Close()
-		}))
+		sess.RegisterTunnel(tunID, closerFunc(cleanup))
 
 		ack, err := codec.EncodeJSON(protocol.MsgTunnelCreateAck, reqID, sess.ID, message.TunnelCreateAck{
 			Success:   true,
@@ -524,7 +528,7 @@ func (s *Server) handleTunnelCreate(ctx context.Context, sess *session.Session, 
 			BoundAddr: ln.Addr().String(),
 		})
 		if err != nil || sess.SendFrame(ack) != nil {
-			_ = ln.Close()
+			_ = cleanup()
 			return
 		}
 		s.log.Info("TCP tunnel created", "tunnel_id", tunID, "client_id", sess.ClientID, "bound", ln.Addr().String(), "local", req.LocalAddr)
@@ -544,18 +548,22 @@ func (s *Server) handleTunnelCreate(ctx context.Context, sess *session.Session, 
 		s.udpMu.Lock()
 		s.udpTunnels[tunID] = pc
 		s.udpMu.Unlock()
+		var cleanupOnce sync.Once
+		cleanup := func() error {
+			cleanupOnce.Do(func() {
+				s.udpMu.Lock()
+				delete(s.udpTunnels, tunID)
+				delete(s.udpPeers, tunID)
+				s.udpMu.Unlock()
+				s.metrics.ActiveTunnels.Add(-1)
+				s.metrics.UnregisterTunnel(tunID)
+				_ = pc.Close()
+			})
+			return nil
+		}
 		s.metrics.ActiveTunnels.Add(1)
 		s.metrics.RegisterTunnel(tunID, "udp", req.LocalAddr)
-
-		sess.RegisterTunnel(tunID, closerFunc(func() error {
-			s.udpMu.Lock()
-			delete(s.udpTunnels, tunID)
-			delete(s.udpPeers, tunID)
-			s.udpMu.Unlock()
-			s.metrics.ActiveTunnels.Add(-1)
-			s.metrics.UnregisterTunnel(tunID)
-			return pc.Close()
-		}))
+		sess.RegisterTunnel(tunID, closerFunc(cleanup))
 
 		ack, err := codec.EncodeJSON(protocol.MsgTunnelCreateAck, reqID, sess.ID, message.TunnelCreateAck{
 			Success:   true,
@@ -563,7 +571,7 @@ func (s *Server) handleTunnelCreate(ctx context.Context, sess *session.Session, 
 			BoundAddr: pc.LocalAddr().String(),
 		})
 		if err != nil || sess.SendFrame(ack) != nil {
-			_ = pc.Close()
+			_ = cleanup()
 			return
 		}
 		s.log.Info("UDP tunnel created", "tunnel_id", tunID, "client_id", sess.ClientID, "bound", pc.LocalAddr().String(), "local", req.LocalAddr)
@@ -580,14 +588,18 @@ func (s *Server) handleTunnelCreate(ctx context.Context, sess *session.Session, 
 			s.sendTunnelCreateErr(sess, reqID, protocol.ErrTunnelCreateFailed, err.Error())
 			return
 		}
+		var cleanupOnce sync.Once
+		cleanup := func() error {
+			cleanupOnce.Do(func() {
+				s.unregisterHTTPRoute(prefix, tunID)
+				s.metrics.ActiveTunnels.Add(-1)
+				s.metrics.UnregisterTunnel(tunID)
+			})
+			return nil
+		}
 		s.metrics.ActiveTunnels.Add(1)
 		s.metrics.RegisterTunnel(tunID, "http", req.LocalAddr)
-		sess.RegisterTunnel(tunID, closerFunc(func() error {
-			s.unregisterHTTPRoute(prefix, tunID)
-			s.metrics.ActiveTunnels.Add(-1)
-			s.metrics.UnregisterTunnel(tunID)
-			return nil
-		}))
+		sess.RegisterTunnel(tunID, closerFunc(cleanup))
 
 		scheme := "http"
 		if s.tlsEnabled {
@@ -600,7 +612,7 @@ func (s *Server) handleTunnelCreate(ctx context.Context, sess *session.Session, 
 			BoundAddr: bound,
 		})
 		if err != nil || sess.SendFrame(ack) != nil {
-			s.unregisterHTTPRoute(prefix, tunID)
+			_ = cleanup()
 			return
 		}
 		s.log.Info("HTTP reverse proxy route created", "tunnel_id", tunID, "client_id", sess.ClientID, "path", prefix, "local", req.LocalAddr)
@@ -775,6 +787,12 @@ func (s *Server) closeProxyConn(connID uint64) {
 	if !ok {
 		return
 	}
+	s.shutdownProxyConn(pc)
+}
+
+// shutdownProxyConn closes a multiplexed connection and releases its
+// per-tunnel active counter exactly once.
+func (s *Server) shutdownProxyConn(pc *proxyConn) {
 	pc.closeOnce.Do(func() {
 		if pc.active.CompareAndSwap(true, false) {
 			if tc := s.metrics.Tunnel(pc.tunnelID); tc != nil {
@@ -795,10 +813,7 @@ func (s *Server) closeAllProxyConns() {
 	}
 	s.connsMu.Unlock()
 	for _, pc := range conns {
-		pc.closeOnce.Do(func() {
-			close(pc.done)
-			_ = pc.conn.Close()
-		})
+		s.shutdownProxyConn(pc)
 	}
 }
 

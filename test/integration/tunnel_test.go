@@ -415,7 +415,7 @@ func TestHTTPReverseProxyMultiRoutes(t *testing.T) {
 
 	// Start two local HTTP services on different local ports.
 	app1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = fmt.Fprintf(w, "app1:%s:prefix=%s", r.URL.Path, r.Header.Get("X-Forwarded-Prefix"))
+		_, _ = fmt.Fprintf(w, "app1:%s:host=%s:prefix=%s", r.URL.Path, r.Host, r.Header.Get("X-Forwarded-Prefix"))
 	}))
 	defer app1.Close()
 
@@ -476,8 +476,9 @@ func TestHTTPReverseProxyMultiRoutes(t *testing.T) {
 	}
 	body1, _ := io.ReadAll(resp1.Body)
 	_ = resp1.Body.Close()
-	if string(body1) != "app1:/users:prefix=/app1" {
-		t.Fatalf("app1 body = %q, want %q", string(body1), "app1:/users:prefix=/app1")
+	wantHost := fmt.Sprintf("app1:/users:host=%s:prefix=/app1", app1.Listener.Addr().String())
+	if string(body1) != wantHost {
+		t.Fatalf("app1 body = %q, want %q", string(body1), wantHost)
 	}
 
 	// 2. /app2/health -> preserved as /app2/health

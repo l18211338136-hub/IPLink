@@ -10,7 +10,8 @@
     "tls_enabled": false,
     "tls_cert_file": "",
     "tls_key_file": "",
-    "token": "${IPLINK_TOKEN}"
+    "token": "${IPLINK_TOKEN}",
+    "allowed_targets": ["127.0.0.1:*", "[::1]:*"]
   },
   "relay": {
     "enabled": true,
@@ -21,7 +22,8 @@
     "enabled": true,
     "port": 29100,
     "listen_ip": "127.0.0.1",
-    "token": ""
+    "token": "",
+    "allow_query_token": false
   },
   "logging": {
     "level": "info",

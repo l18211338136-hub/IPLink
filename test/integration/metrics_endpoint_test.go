@@ -148,7 +148,17 @@ func TestMetricsEndpointRequiresToken(t *testing.T) {
 		t.Fatalf("authenticated status = %d, want 200", resp.StatusCode)
 	}
 	if !strings.Contains(string(body), "iplink_online_clients") {
-		t.Fatalf("metrics body missing expected metric:/n%s", body)
+		t.Fatalf("metrics body missing expected metric:\n%s", body)
+	}
+
+	// Query token must not be accepted unless explicitly enabled.
+	resp, err = client.Get("http://" + srv.MetricsAddr() + "/metrics?token=" + token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("query-token status = %d, want 401", resp.StatusCode)
 	}
 }
 
