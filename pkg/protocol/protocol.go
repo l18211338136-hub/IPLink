@@ -5,7 +5,9 @@ import "errors"
 // ProtocolVersion is the current wire protocol version, independent of software version.
 // v2: UDP datagrams (NAT discovery, P2P punching, peer channels, relay payloads)
 // are encrypted with AES-256-GCM keyed from the shared token.
-const ProtocolVersion uint16 = 2
+// v3: relay sessions use random IDs and a per-session HMAC token; v2 peers are
+// incompatible at the relay data plane and must be upgraded together.
+const ProtocolVersion uint16 = 3
 
 // HeaderSize is the fixed byte length of MessageHeader on the wire.
 const HeaderSize = 26

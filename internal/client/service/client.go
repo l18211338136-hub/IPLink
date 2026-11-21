@@ -32,17 +32,17 @@ import (
 )
 
 const (
-	heartbeatInterval    = 20 * time.Second
-	missedPongLimit      = 3 // 连续 3 次心跳无 PONG 判定链路半开（默认 60s）
-	streamQueueSize      = 64
-	readChunkSize        = 32 * 1024
-	udpIdleTimeout       = 60 * time.Second
-	peerRecvQueueSize    = 64
-	peerPingInterval     = 300 * time.Millisecond
-	peerPingTimeout      = 3 * time.Second
-	peerPingPrefix       = "IPLINK_PING:"
-	peerPongPrefix       = "IPLINK_PONG:"
-	peerRelayJoinPayload = "IPLINK_JOIN"
+	heartbeatInterval   = 20 * time.Second
+	missedPongLimit     = 3 // 连续 3 次心跳无 PONG 判定链路半开（默认 60s）
+	streamQueueSize     = 64
+	readChunkSize       = 32 * 1024
+	udpIdleTimeout      = 60 * time.Second
+	peerRecvQueueSize   = 64
+	peerPingInterval    = 300 * time.Millisecond
+	peerPingTimeout     = 3 * time.Second
+	peerPingPrefix      = "IPLINK_PING:"
+	peerPongPrefix      = "IPLINK_PONG:"
+	peerRelayJoinPrefix = "IPLINK_JOIN:"
 )
 
 // ActiveTunnel records a tunnel registered with the server.
@@ -365,11 +365,12 @@ func (c *Client) ListPeers(ctx context.Context) ([]message.PeerInfo, error) {
 
 // PeerChannel represents an established P2P or Relay UDP channel to a peer.
 type PeerChannel struct {
-	Mode     string // "p2p" or "relay"
-	PeerID   string
-	Conn     net.PacketConn
-	PeerAddr net.Addr
-	RelayID  string
+	Mode       string // "p2p" or "relay"
+	PeerID     string
+	Conn       net.PacketConn
+	PeerAddr   net.Addr
+	RelayID    string
+	relayToken string
 
 	cipher    *clientcrypto.DatagramCipher
 	recvCh    chan []byte
@@ -378,17 +379,18 @@ type PeerChannel struct {
 	closeOnce sync.Once
 }
 
-func newPeerChannel(mode, peerID string, conn net.PacketConn, peerAddr net.Addr, relayID string, cipher *clientcrypto.DatagramCipher) *PeerChannel {
+func newPeerChannel(mode, peerID string, conn net.PacketConn, peerAddr net.Addr, relayID, relayToken string, cipher *clientcrypto.DatagramCipher) *PeerChannel {
 	ch := &PeerChannel{
-		Mode:     mode,
-		PeerID:   peerID,
-		Conn:     conn,
-		PeerAddr: peerAddr,
-		RelayID:  relayID,
-		cipher:   cipher,
-		recvCh:   make(chan []byte, peerRecvQueueSize),
-		pongCh:   make(chan []byte, 8),
-		done:     make(chan struct{}),
+		Mode:       mode,
+		PeerID:     peerID,
+		Conn:       conn,
+		PeerAddr:   peerAddr,
+		RelayID:    relayID,
+		relayToken: relayToken,
+		cipher:     cipher,
+		recvCh:     make(chan []byte, peerRecvQueueSize),
+		pongCh:     make(chan []byte, 8),
+		done:       make(chan struct{}),
 	}
 	go ch.readLoop()
 	return ch
@@ -404,7 +406,7 @@ func (ch *PeerChannel) readLoop() {
 		}
 		payload := buf[:n]
 		if ch.Mode == "relay" {
-			sid, body, err := relaymgr.DecodeRelayPacket(payload)
+			sid, body, err := relaymgr.DecodeRelayPacket(payload, ch.relayToken)
 			if err != nil || sid != ch.RelayID {
 				continue
 			}
@@ -416,6 +418,9 @@ func (ch *PeerChannel) readLoop() {
 		}
 		if punching.IsPunchPacket(plain) {
 			continue // 打洞阶段的残留包
+		}
+		if bytes.HasPrefix(plain, []byte(peerRelayJoinPrefix)) {
+			continue // relay 建连控制包，不投递给业务层
 		}
 		if bytes.HasPrefix(plain, []byte(peerPingPrefix)) {
 			reply := append([]byte(peerPongPrefix), plain[len(peerPingPrefix):]...)
@@ -451,7 +456,7 @@ func (ch *PeerChannel) Send(payload []byte) error {
 	sealed := ch.cipher.Seal(payload)
 	data := sealed
 	if ch.Mode == "relay" {
-		data = relaymgr.EncodeRelayPacket(ch.RelayID, sealed)
+		data = relaymgr.EncodeRelayPacket(ch.RelayID, ch.relayToken, sealed)
 	}
 	_, err := ch.Conn.WriteTo(data, ch.PeerAddr)
 	return err
@@ -565,7 +570,7 @@ func (c *Client) ConnectPeer(ctx context.Context, targetClientID string) (*PeerC
 				peerAddr, punchErr := punching.Punch(ctx, pc, info.PunchToken, []string{info.PeerPublicAddr, info.PeerLocalAddr}, c.dgramCipher)
 				if punchErr == nil {
 					c.metrics.P2PSuccesses.Add(1)
-					return newPeerChannel("p2p", targetClientID, pc, peerAddr, "", c.dgramCipher), nil
+					return newPeerChannel("p2p", targetClientID, pc, peerAddr, "", "", c.dgramCipher), nil
 				}
 				c.log.Info("P2P punching failed, falling back to relay", "peer", targetClientID, "err", punchErr)
 			}
@@ -609,7 +614,7 @@ func (c *Client) ConnectPeer(ctx context.Context, targetClientID string) (*PeerC
 		closePC()
 		return nil, err
 	}
-	return newPeerChannel("relay", targetClientID, pc, relayUDPAddr, ack.RelaySessionID, c.dgramCipher), nil
+	return newPeerChannel("relay", targetClientID, pc, relayUDPAddr, ack.RelaySessionID, ack.RelayToken, c.dgramCipher), nil
 }
 
 func (c *Client) authenticate(conn net.Conn) (uint64, error) {
@@ -877,7 +882,7 @@ func (c *Client) handleIncomingPeerConnect(ctx context.Context, info message.Pee
 		c.log.Debug("incoming P2P punch failed", "peer", info.PeerID, "err", err)
 		return
 	}
-	ch := newPeerChannel("p2p", info.PeerID, pc, peerAddr, "", c.dgramCipher)
+	ch := newPeerChannel("p2p", info.PeerID, pc, peerAddr, "", "", c.dgramCipher)
 	c.RegisterIncoming(info.PeerID, ch)
 	c.log.Info("incoming P2P hole punch succeeded", "peer", info.PeerID, "peer_addr", peerAddr.String())
 }
@@ -895,9 +900,9 @@ func (c *Client) handleIncomingRelay(notify message.RelayAllocNotify) {
 		_ = pc.Close()
 		return
 	}
-	ch := newPeerChannel("relay", notify.FromClientID, pc, relayAddr, notify.RelaySessionID, c.dgramCipher)
+	ch := newPeerChannel("relay", notify.FromClientID, pc, relayAddr, notify.RelaySessionID, notify.RelayToken, c.dgramCipher)
 	c.RegisterIncoming(notify.FromClientID, ch)
-	_ = ch.Send([]byte(peerRelayJoinPayload))
+	_ = ch.Send([]byte(peerRelayJoinPrefix + notify.RelaySessionID))
 	c.log.Info("joined relay session", "peer", notify.FromClientID, "relay", notify.RelaySessionID)
 }
 

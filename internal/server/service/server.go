@@ -36,6 +36,7 @@ const (
 	heartbeatTimeout = 60 * time.Second
 	streamQueueSize  = 64
 	readChunkSize    = 32 * 1024
+	udpPeerTTL       = 2 * time.Minute
 )
 
 // Server coordinates control connections, TCP/UDP reverse tunnels, NAT discovery, and Relay.
@@ -61,6 +62,7 @@ type Server struct {
 
 	udpMu      sync.RWMutex
 	udpTunnels map[string]net.PacketConn
+	udpPeers   map[string]map[string]time.Time // tunnelID -> observed peer addr -> last seen
 
 	httpMu     sync.RWMutex
 	httpRoutes map[string]*httpRoute
@@ -99,6 +101,7 @@ func New(cfg config.ServerConfig, log *slog.Logger) *Server {
 		sessions:   session.NewManager(m),
 		proxyConns: make(map[uint64]*proxyConn),
 		udpTunnels: make(map[string]net.PacketConn),
+		udpPeers:   make(map[string]map[string]time.Time),
 		httpRoutes: make(map[string]*httpRoute),
 	}
 	if len(cfg.Security.AllowedTargets) > 0 {
@@ -547,6 +550,7 @@ func (s *Server) handleTunnelCreate(ctx context.Context, sess *session.Session, 
 		sess.RegisterTunnel(tunID, closerFunc(func() error {
 			s.udpMu.Lock()
 			delete(s.udpTunnels, tunID)
+			delete(s.udpPeers, tunID)
 			s.udpMu.Unlock()
 			s.metrics.ActiveTunnels.Add(-1)
 			s.metrics.UnregisterTunnel(tunID)
@@ -798,6 +802,42 @@ func (s *Server) closeAllProxyConns() {
 	}
 }
 
+// rememberUDPPeer records a real source address observed on the public UDP
+// tunnel. Only these addresses may be used as reply targets by clients.
+func (s *Server) rememberUDPPeer(tunID string, addr net.Addr) {
+	key := addr.String()
+	now := time.Now()
+	s.udpMu.Lock()
+	peers := s.udpPeers[tunID]
+	if peers == nil {
+		peers = make(map[string]time.Time)
+		s.udpPeers[tunID] = peers
+	}
+	for seenAddr, seenAt := range peers {
+		if now.Sub(seenAt) > udpPeerTTL {
+			delete(peers, seenAddr)
+		}
+	}
+	peers[key] = now
+	s.udpMu.Unlock()
+}
+
+// allowUDPPeer reports whether addr was recently observed as a real peer of tunID.
+func (s *Server) allowUDPPeer(tunID, addr string) bool {
+	s.udpMu.Lock()
+	defer s.udpMu.Unlock()
+	peers := s.udpPeers[tunID]
+	seenAt, ok := peers[addr]
+	if !ok {
+		return false
+	}
+	if time.Since(seenAt) > udpPeerTTL {
+		delete(peers, addr)
+		return false
+	}
+	return true
+}
+
 func (s *Server) serveUDPTunnel(ctx context.Context, sess *session.Session, tunID string, pc net.PacketConn) {
 	buf := make([]byte, protocol.MaxUDPPacketSize)
 	for {
@@ -808,6 +848,7 @@ func (s *Server) serveUDPTunnel(ctx context.Context, sess *session.Session, tunI
 			}
 			return
 		}
+		s.rememberUDPPeer(tunID, peerAddr)
 		s.metrics.BytesReceived.Add(uint64(n))
 		if tc := s.metrics.Tunnel(tunID); tc != nil {
 			tc.BytesReceived.Add(uint64(n))
@@ -837,6 +878,12 @@ func (s *Server) handleUDPFromClient(dgram message.UDPDatagram) {
 	}
 	addr, err := net.ResolveUDPAddr("udp", dgram.PeerAddr)
 	if err != nil {
+		return
+	}
+	// The client must not choose arbitrary reply targets: only addresses that
+	// were actually observed on this tunnel may be written back to.
+	if !s.allowUDPPeer(dgram.TunnelID, addr.String()) {
+		s.log.Debug("udp reply target not observed on tunnel", "tunnel_id", dgram.TunnelID, "peer_addr", dgram.PeerAddr)
 		return
 	}
 	n, err := pc.WriteTo(payload, addr)
@@ -892,7 +939,7 @@ func (s *Server) handleRelayAlloc(sess *session.Session, reqID uint64, req messa
 		_ = sess.SendFrame(ack)
 		return
 	}
-	rid, err := s.relayMgr.Allocate()
+	rid, relayToken, err := s.relayMgr.Allocate(sess.ClientID, target.ClientID)
 	if err != nil {
 		ack, _ := codec.EncodeJSON(protocol.MsgRelayAllocAck, reqID, sess.ID, message.RelayAllocAck{
 			Success:   false,
@@ -906,6 +953,7 @@ func (s *Server) handleRelayAlloc(sess *session.Session, reqID uint64, req messa
 		Success:        true,
 		RelaySessionID: rid,
 		RelayAddr:      s.relayMgr.Addr(),
+		RelayToken:     relayToken,
 	})
 	_ = sess.SendFrame(ack)
 
@@ -913,6 +961,7 @@ func (s *Server) handleRelayAlloc(sess *session.Session, reqID uint64, req messa
 		FromClientID:   sess.ClientID,
 		RelaySessionID: rid,
 		RelayAddr:      s.relayMgr.Addr(),
+		RelayToken:     relayToken,
 	})
 	_ = target.SendFrame(notify)
 }

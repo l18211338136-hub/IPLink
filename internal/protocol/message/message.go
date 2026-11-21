@@ -158,6 +158,7 @@ type RelayAllocAck struct {
 	Success        bool               `json:"success"`
 	RelaySessionID string             `json:"relay_session_id,omitempty"`
 	RelayAddr      string             `json:"relay_addr,omitempty"`
+	RelayToken     string             `json:"relay_token,omitempty"`
 	ErrorCode      protocol.ErrorCode `json:"error_code,omitempty"`
 	Error          string             `json:"error,omitempty"`
 }
@@ -167,6 +168,7 @@ type RelayAllocNotify struct {
 	FromClientID   string `json:"from_client_id"`
 	RelaySessionID string `json:"relay_session_id"`
 	RelayAddr      string `json:"relay_addr"`
+	RelayToken     string `json:"relay_token"`
 }
 
 // ErrorMsg conveys a protocol-level error.
