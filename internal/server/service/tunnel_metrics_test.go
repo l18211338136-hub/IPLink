@@ -29,13 +29,14 @@ func TestTunnelCreateAckFailureRollsBackMetrics(t *testing.T) {
 	for _, proto := range []string{"tcp", "udp"} {
 		t.Run(proto, func(t *testing.T) {
 			s := &Server{
-				cfg:        config.DefaultServerConfig(),
-				log:        slog.New(slog.NewTextHandler(io.Discard, nil)),
-				metrics:    &metrics.Metrics{},
-				proxyConns: make(map[uint64]*proxyConn),
-				udpTunnels: make(map[string]net.PacketConn),
-				udpPeers:   make(map[string]map[string]time.Time),
-				httpRoutes: make(map[string]*httpRoute),
+				cfg:            config.DefaultServerConfig(),
+				log:            slog.New(slog.NewTextHandler(io.Discard, nil)),
+				metrics:        &metrics.Metrics{},
+				proxyConns:     make(map[uint64]*proxyConn),
+				udpTunnels:     make(map[string]net.PacketConn),
+				udpTunnelOwner: make(map[string]uint64),
+				udpPeers:       make(map[string]map[string]time.Time),
+				httpRoutes:     make(map[string]*httpRoute),
 			}
 			s.handleTunnelCreate(context.Background(), failingSession(t), 1, message.TunnelCreate{
 				Protocol:   proto,

@@ -203,6 +203,54 @@ function closeModal() {
   el("tunnelModal").classList.add("hidden");
 }
 
+function openSetupWizard(defaultCfg) {
+  el("wServerAddr").value = defaultCfg.server?.address || "";
+  el("wServerPort").value = defaultCfg.server?.port || 29000;
+  el("wClientId").value = defaultCfg.client?.id || "windows-client-001";
+  el("wToken").value = defaultCfg.security?.token || "";
+  el("wAllowedTargets").value = (defaultCfg.security?.allowed_targets || ["127.0.0.1:*"]).join(", ");
+  el("wError").classList.add("hidden");
+  el("setupWizard").classList.remove("hidden");
+}
+
+async function finishSetupWizard() {
+  const address = el("wServerAddr").value.trim();
+  if (!address) {
+    el("wError").textContent = "请填写服务端 IP 地址";
+    el("wError").classList.remove("hidden");
+    return;
+  }
+  const targets = el("wAllowedTargets")
+    .value.split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const next = {
+    ...currentConfig,
+    client: { id: el("wClientId").value.trim() || "windows-client-001" },
+    server: {
+      address,
+      port: Number(el("wServerPort").value) || 29000,
+      relay_port: currentConfig?.server?.relay_port || 29001,
+      nat_port: currentConfig?.server?.nat_port || 29002,
+    },
+    security: {
+      ...currentConfig?.security,
+      token: el("wToken").value,
+      allowed_targets: targets,
+    },
+  };
+  try {
+    await App().SaveConfig(next);
+    fillForm(next);
+    currentConfig = next;
+    el("setupWizard").classList.add("hidden");
+    showToast("设置已保存，现在可以添加隧道并连接");
+  } catch (e) {
+    el("wError").textContent = "保存失败: " + e;
+    el("wError").classList.remove("hidden");
+  }
+}
+
 async function init() {
   if (!App()) {
     showToast("Wails 运行时未就绪", true);
@@ -211,6 +259,17 @@ async function init() {
 
   const cfg = await App().GetConfig();
   fillForm(cfg);
+
+  // 首次运行引导：无配置或服务端地址为空时弹出快速设置。
+  el("btnWizardFinish").addEventListener("click", finishSetupWizard);
+  el("btnWizardSkip").addEventListener("click", () => {
+    el("setupWizard").classList.add("hidden");
+  });
+  try {
+    if (await App().IsFirstRun()) openSetupWizard(cfg);
+  } catch (e) {
+    // IsFirstRun 不可用时（旧版后端）静默跳过，不影响主流程。
+  }
 
   const status = await App().GetStatus();
   updateStatusUI(status);

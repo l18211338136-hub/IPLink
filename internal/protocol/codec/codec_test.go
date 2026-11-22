@@ -42,3 +42,35 @@ func TestEncodeDecodeTunnelData(t *testing.T) {
 		t.Fatalf("payload = %q, want %q", got, payload)
 	}
 }
+
+// TunnelDataFrame must produce a byte-identical frame to EncodeTunnelData,
+// but reference the caller's buffer instead of copying it.
+func TestTunnelDataFrameZeroCopy(t *testing.T) {
+	payload := []byte("zero copy payload")
+	buf := make([]byte, 8+len(payload))
+	EncodeTunnelDataPrefix(buf, 42)
+	copy(buf[8:], payload)
+
+	f := TunnelDataFrame(3, 9, buf)
+	ref := EncodeTunnelData(3, 9, 42, payload)
+
+	if !bytes.Equal(f.Payload, ref.Payload) {
+		t.Fatalf("payload mismatch: got %x, want %x", f.Payload, ref.Payload)
+	}
+	if f.Header.Type != ref.Header.Type || f.Header.Length != ref.Header.Length ||
+		f.Header.SessionID != 9 || f.Header.RequestID != 3 {
+		t.Fatalf("header mismatch: got %+v, want %+v", f.Header, ref.Header)
+	}
+	// The frame must reference the original buffer, not a copy.
+	f.Payload[8] = 'X'
+	if buf[8] != 'X' {
+		t.Fatal("TunnelDataFrame copied the buffer instead of referencing it")
+	}
+	connID, got, err := DecodeTunnelData(f.Payload)
+	if err != nil || connID != 42 {
+		t.Fatalf("DecodeTunnelData: connID=%d err=%v", connID, err)
+	}
+	if string(got) != "Xero copy payload" {
+		t.Fatalf("unexpected payload after mutation: %q", got)
+	}
+}

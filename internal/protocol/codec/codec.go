@@ -54,6 +54,30 @@ func EncodeTunnelData(reqID, sessionID, connID uint64, data []byte) frame.Frame 
 	}
 }
 
+// TunnelDataFrame builds a MsgTunnelData frame that references data directly,
+// avoiding the extra copy in EncodeTunnelData. The caller must lay out data as
+// [8-byte big-endian ConnID][payload] and must not mutate it until the frame
+// has been written (both Session.SendFrame and Client.sendFrame write synchronously).
+func TunnelDataFrame(reqID, sessionID uint64, data []byte) frame.Frame {
+	return frame.Frame{
+		Header: protocol.MessageHeader{
+			Version:   protocol.ProtocolVersion,
+			Type:      protocol.MsgTunnelData,
+			Flags:     protocol.FlagNone,
+			Length:    uint32(len(data)),
+			RequestID: reqID,
+			SessionID: sessionID,
+		},
+		Payload: data,
+	}
+}
+
+// EncodeTunnelDataPrefix writes an 8-byte big-endian ConnID at the head of a
+// reusable buffer, so the payload can be framed without an allocation.
+func EncodeTunnelDataPrefix(dst []byte, connID uint64) {
+	binary.BigEndian.PutUint64(dst[:8], connID)
+}
+
 // DecodeTunnelData unpacks a binary TunnelData frame into ConnID and raw data slice.
 func DecodeTunnelData(payload []byte) (uint64, []byte, error) {
 	if len(payload) < 8 {

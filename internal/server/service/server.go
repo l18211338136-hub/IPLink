@@ -60,9 +60,10 @@ type Server struct {
 	nextConnID atomic.Uint64
 	nextTunID  atomic.Uint64
 
-	udpMu      sync.RWMutex
-	udpTunnels map[string]net.PacketConn
-	udpPeers   map[string]map[string]time.Time // tunnelID -> observed peer addr -> last seen
+	udpMu          sync.RWMutex
+	udpTunnels     map[string]net.PacketConn
+	udpTunnelOwner map[string]uint64               // tunnelID -> owning session ID
+	udpPeers       map[string]map[string]time.Time // tunnelID -> observed peer addr -> last seen
 
 	httpMu     sync.RWMutex
 	httpRoutes map[string]*httpRoute
@@ -82,6 +83,7 @@ type Server struct {
 type proxyConn struct {
 	id        uint64
 	tunnelID  string // server-assigned tunnel ID, for per-tunnel counters
+	ownerID   uint64 // session ID that created this conn; cross-session frames are rejected
 	conn      net.Conn
 	sendCh    chan []byte
 	readyCh   chan bool
@@ -94,15 +96,16 @@ type proxyConn struct {
 func New(cfg config.ServerConfig, log *slog.Logger) *Server {
 	m := &metrics.Metrics{}
 	s := &Server{
-		cfg:        cfg,
-		log:        log,
-		metrics:    m,
-		tlsEnabled: cfg.Security.TLSEnabled,
-		sessions:   session.NewManager(m),
-		proxyConns: make(map[uint64]*proxyConn),
-		udpTunnels: make(map[string]net.PacketConn),
-		udpPeers:   make(map[string]map[string]time.Time),
-		httpRoutes: make(map[string]*httpRoute),
+		cfg:            cfg,
+		log:            log,
+		metrics:        m,
+		tlsEnabled:     cfg.Security.TLSEnabled,
+		sessions:       session.NewManager(m),
+		proxyConns:     make(map[uint64]*proxyConn),
+		udpTunnels:     make(map[string]net.PacketConn),
+		udpTunnelOwner: make(map[string]uint64),
+		udpPeers:       make(map[string]map[string]time.Time),
+		httpRoutes:     make(map[string]*httpRoute),
 	}
 	// NewTargetValidator treats an empty list as loopback-only, matching the
 	// client-side default. Explicit "*:*" is required for unrestricted targets.
@@ -426,11 +429,14 @@ func (s *Server) dispatchFrame(ctx context.Context, sess *session.Session, f fra
 		s.connsMu.RLock()
 		pc, ok := s.proxyConns[ack.ConnID]
 		s.connsMu.RUnlock()
-		if ok {
-			select {
-			case pc.readyCh <- ack.Success:
-			default:
-			}
+		// Ownership check: only the session that opened a conn may ack/close it.
+		if !ok || pc.ownerID != sess.ID {
+			s.log.Warn("cross-session tunnel ack rejected", "conn_id", ack.ConnID, "client_id", sess.ClientID)
+			return
+		}
+		select {
+		case pc.readyCh <- ack.Success:
+		default:
 		}
 		if !ack.Success {
 			s.closeProxyConn(ack.ConnID)
@@ -441,12 +447,12 @@ func (s *Server) dispatchFrame(ctx context.Context, sess *session.Session, f fra
 		if err != nil {
 			return
 		}
-		s.forwardToProxyConn(connID, data)
+		s.forwardToProxyConn(sess.ID, connID, data)
 
 	case protocol.MsgTunnelClose:
 		var cls message.TunnelClose
 		if err := codec.DecodeJSON(f, &cls); err == nil {
-			s.closeProxyConn(cls.ConnID)
+			s.closeProxyConnOwned(sess.ID, cls.ConnID)
 		}
 
 	case protocol.MsgUDPDatagram:
@@ -454,7 +460,7 @@ func (s *Server) dispatchFrame(ctx context.Context, sess *session.Session, f fra
 		if err := codec.DecodeJSON(f, &dgram); err != nil {
 			return
 		}
-		s.handleUDPFromClient(dgram)
+		s.handleUDPFromClient(sess.ID, dgram)
 
 	case protocol.MsgPeerListReq:
 		peers := s.sessions.ListPeers()
@@ -547,12 +553,14 @@ func (s *Server) handleTunnelCreate(ctx context.Context, sess *session.Session, 
 		}
 		s.udpMu.Lock()
 		s.udpTunnels[tunID] = pc
+		s.udpTunnelOwner[tunID] = sess.ID
 		s.udpMu.Unlock()
 		var cleanupOnce sync.Once
 		cleanup := func() error {
 			cleanupOnce.Do(func() {
 				s.udpMu.Lock()
 				delete(s.udpTunnels, tunID)
+				delete(s.udpTunnelOwner, tunID)
 				delete(s.udpPeers, tunID)
 				s.udpMu.Unlock()
 				s.metrics.ActiveTunnels.Add(-1)
@@ -647,6 +655,7 @@ func (s *Server) acceptTCPTunnel(ctx context.Context, sess *session.Session, tun
 		pc := &proxyConn{
 			id:       connID,
 			tunnelID: tunID,
+			ownerID:  sess.ID,
 			conn:     extConn,
 			sendCh:   make(chan []byte, streamQueueSize),
 			readyCh:  make(chan bool, 1),
@@ -728,15 +737,18 @@ func (s *Server) readProxyConnLoop(sess *session.Session, pc *proxyConn) {
 		}
 	}()
 
-	buf := make([]byte, readChunkSize)
+	// Reserve 8 bytes for the ConnID prefix so the chunk can be framed and
+	// written synchronously without an extra allocation per packet.
+	buf := make([]byte, 8+readChunkSize)
 	for {
-		n, err := pc.conn.Read(buf)
+		n, err := pc.conn.Read(buf[8:])
 		if n > 0 {
 			s.metrics.BytesReceived.Add(uint64(n))
 			if tc := s.metrics.Tunnel(pc.tunnelID); tc != nil {
 				tc.BytesReceived.Add(uint64(n))
 			}
-			dataFrame := codec.EncodeTunnelData(0, sess.ID, pc.id, buf[:n])
+			codec.EncodeTunnelDataPrefix(buf, pc.id)
+			dataFrame := codec.TunnelDataFrame(0, sess.ID, buf[:8+n])
 			if sendErr := sess.SendFrame(dataFrame); sendErr != nil {
 				return
 			}
@@ -747,20 +759,20 @@ func (s *Server) readProxyConnLoop(sess *session.Session, pc *proxyConn) {
 	}
 }
 
-func (s *Server) forwardToProxyConn(connID uint64, data []byte) {
+func (s *Server) forwardToProxyConn(ownerID, connID uint64, data []byte) {
 	s.connsMu.RLock()
 	pc, ok := s.proxyConns[connID]
 	s.connsMu.RUnlock()
-	if !ok {
+	if !ok || pc.ownerID != ownerID {
+		s.log.Warn("cross-session tunnel data rejected", "conn_id", connID, "session_id", ownerID)
 		return
 	}
-	cp := make([]byte, len(data))
-	copy(cp, data)
-
+	// data is the per-frame payload owned by ReadFrame; handing the slice to
+	// the channel keeps it alive until written, so no defensive copy is needed.
 	select {
 	case <-pc.done:
 		return
-	case pc.sendCh <- cp:
+	case pc.sendCh <- data:
 	case <-time.After(5 * time.Second):
 		// Backpressure timeout: drop slow consumer to protect server memory.
 		s.closeProxyConn(connID)
@@ -788,6 +800,20 @@ func (s *Server) closeProxyConn(connID uint64) {
 		return
 	}
 	s.shutdownProxyConn(pc)
+}
+
+// closeProxyConnOwned only closes a conn if it belongs to ownerID. It prevents
+// a malicious client from closing another session's active connection by
+// guessing a globally incrementing ConnID.
+func (s *Server) closeProxyConnOwned(ownerID, connID uint64) {
+	s.connsMu.RLock()
+	pc, ok := s.proxyConns[connID]
+	s.connsMu.RUnlock()
+	if !ok || pc.ownerID != ownerID {
+		s.log.Warn("cross-session tunnel close rejected", "conn_id", connID, "session_id", ownerID)
+		return
+	}
+	s.closeProxyConn(connID)
 }
 
 // shutdownProxyConn closes a multiplexed connection and releases its
@@ -880,11 +906,13 @@ func (s *Server) serveUDPTunnel(ctx context.Context, sess *session.Session, tunI
 	}
 }
 
-func (s *Server) handleUDPFromClient(dgram message.UDPDatagram) {
+func (s *Server) handleUDPFromClient(ownerID uint64, dgram message.UDPDatagram) {
 	s.udpMu.RLock()
 	pc, ok := s.udpTunnels[dgram.TunnelID]
+	owner := s.udpTunnelOwner[dgram.TunnelID]
 	s.udpMu.RUnlock()
-	if !ok {
+	if !ok || owner != ownerID {
+		s.log.Warn("cross-session udp datagram rejected", "tunnel_id", dgram.TunnelID, "session_id", ownerID)
 		return
 	}
 	payload, err := base64.StdEncoding.DecodeString(dgram.PayloadB64)

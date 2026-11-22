@@ -374,3 +374,30 @@ th {
 .hidden {
   display: none !important;
 }
+
+/* 首次运行引导 */
+.wizard-dialog {
+  width: 480px;
+}
+
+.wizard-intro {
+  margin: 0 0 4px;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.field-grid-2 {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+.wizard-error {
+  margin: 4px 0 0;
+  padding: 8px 10px;
+  border: 1px solid var(--danger);
+  border-radius: 6px;
+  color: #fecaca;
+  font-size: 12px;
+}

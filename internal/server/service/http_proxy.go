@@ -224,6 +224,7 @@ func (s *Server) dialTunnelStream(serverCtx, dialCtx context.Context, route *htt
 	pc := &proxyConn{
 		id:       connID,
 		tunnelID: route.tunnelID,
+		ownerID:  route.sess.ID,
 		conn:     clientSide,
 		sendCh:   make(chan []byte, streamQueueSize),
 		readyCh:  make(chan bool, 1),

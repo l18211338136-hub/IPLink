@@ -982,12 +982,13 @@ func (c *Client) readLocalStream(sessID uint64, ls *localStream) {
 		}
 	}()
 
-	buf := make([]byte, readChunkSize)
+	buf := make([]byte, 8+readChunkSize)
 	for {
-		n, err := ls.conn.Read(buf)
+		n, err := ls.conn.Read(buf[8:])
 		if n > 0 {
 			c.metrics.BytesReceived.Add(uint64(n))
-			df := codec.EncodeTunnelData(0, sessID, ls.connID, buf[:n])
+			codec.EncodeTunnelDataPrefix(buf, ls.connID)
+			df := codec.TunnelDataFrame(0, sessID, buf[:8+n])
 			if sendErr := c.sendFrame(df); sendErr != nil {
 				return
 			}
@@ -1008,13 +1009,10 @@ func (c *Client) forwardToLocalStream(connID uint64, data []byte) {
 	if !ok {
 		return
 	}
-	cp := make([]byte, len(data))
-	copy(cp, data)
-
 	select {
 	case <-ls.done:
 		return
-	case ls.sendCh <- cp:
+	case ls.sendCh <- data:
 	case <-time.After(5 * time.Second):
 		c.closeLocalStream(connID)
 	}

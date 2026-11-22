@@ -220,6 +220,46 @@
     </div>
   </div>
 
+  <!-- 首次运行引导 -->
+  <div id="setupWizard" class="modal hidden">
+    <div class="modal-backdrop"></div>
+    <div class="modal-dialog wizard-dialog">
+      <div class="modal-header">
+        <h3>欢迎使用 IP Link — 快速设置</h3>
+      </div>
+      <div class="modal-body">
+        <p class="wizard-intro">首次运行需要填写服务端信息。之后可在主界面随时修改。</p>
+        <div class="field">
+          <label for="wServerAddr">服务端 IP（纯 IP 地址）</label>
+          <input id="wServerAddr" type="text" placeholder="例如 8.134.86.34" />
+        </div>
+        <div class="field-grid-2">
+          <div class="field">
+            <label for="wServerPort">控制端口</label>
+            <input id="wServerPort" type="number" min="1" max="65535" value="29000" />
+          </div>
+          <div class="field">
+            <label for="wClientId">客户端 ID</label>
+            <input id="wClientId" type="text" value="windows-client-001" />
+          </div>
+        </div>
+        <div class="field">
+          <label for="wToken">认证密钥 (Token)</label>
+          <input id="wToken" type="password" placeholder="与服务端一致的密钥" />
+        </div>
+        <div class="field">
+          <label for="wAllowedTargets">允许转发的本地目标白名单（逗号分隔）</label>
+          <input id="wAllowedTargets" type="text" value="127.0.0.1:*" />
+        </div>
+        <p id="wError" class="wizard-error hidden"></p>
+      </div>
+      <div class="modal-footer">
+        <button id="btnWizardSkip" class="btn btn-secondary">稍后设置</button>
+        <button id="btnWizardFinish" class="btn btn-primary">保存并继续</button>
+      </div>
+    </div>
+  </div>
+
   <script src="app.js"></script>
 </body>
 </html>

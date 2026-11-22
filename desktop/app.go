@@ -69,6 +69,21 @@ func (a *App) shutdown(_ context.Context) {
 	_ = a.Disconnect()
 }
 
+// IsFirstRun reports whether the user still needs the setup wizard. It is
+// true when no config file exists yet or the saved config has no server
+// address (incomplete/placeholder config).
+func (a *App) IsFirstRun() bool {
+	data, err := os.ReadFile(a.configPath)
+	if err != nil {
+		return true
+	}
+	cfg, err := iplinkclient.ParseConfig(data)
+	if err != nil {
+		return true
+	}
+	return strings.TrimSpace(cfg.Server.Address) == ""
+}
+
 // GetConfig loads the saved configuration or returns sensible defaults.
 func (a *App) GetConfig() iplinkclient.Config {
 	data, err := os.ReadFile(a.configPath)

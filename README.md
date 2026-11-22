@@ -141,6 +141,20 @@ scrape_configs:
 - **服务端 `relay.max_bytes_per_sec`**：Relay 出口字节速率上限，超出的 UDP 数据报会被丢弃；`0` 或负数表示不限速。
 - **服务端 `metrics.enabled` / `metrics.port` / `metrics.listen_ip` / `metrics.token` / `metrics.allow_query_token`**：内置指标端点开关、端口（默认 `29100`）、监听 IP（默认 `127.0.0.1`）、访问 token 与查询参数兼容开关（默认 `false`）。端口需与其它服务端口互不相同，`0` 表示动态分配；监听非 loopback 地址时 `token` 必填，请求默认只接受 `Authorization: Bearer`。
 
+## 桌面客户端与安装
+
+`desktop/` 是独立的 Go module，使用 Wails 将前端嵌入单个 Windows 可执行文件（GUI 子系统，无控制台窗口）。
+
+- **首次运行向导**：首次启动（或配置中服务端地址为空）时自动弹出快速设置，引导填写服务端 IP、端口、客户端 ID、Token 与本地目标白名单；保存后写入用户配置目录 `%APPDATA%\IPLink\client.json`，之后可在主界面修改。
+- **编译**：`cd desktop && bash build.sh`（脚本自定位路径，不再依赖个人目录）。产物 `bin/iplink-desktop.exe`。
+- **Windows 安装包（NSIS）**：
+  ```bash
+  # 先构建 exe，再生成 setup.exe
+  cd desktop && bash build.sh
+  cd installer && makensis /DIPLINK_EXE=..\..\bin\iplink-desktop.exe install.nsi
+  # 产物：bin/IPLink-Setup.exe（安装到 %LOCALAPPDATA%\Programs\IPLink，含开始菜单/桌面快捷方式与卸载项）
+  ```
+
 ## 测试
 
 ```bash

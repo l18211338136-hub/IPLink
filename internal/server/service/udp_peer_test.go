@@ -25,11 +25,13 @@ func TestUDPReplyRequiresObservedPeer(t *testing.T) {
 	}
 	defer tunnelPC.Close()
 
+	const testSessionID uint64 = 7
 	srv := &Server{
-		log:        slog.New(slog.NewTextHandler(io.Discard, nil)),
-		metrics:    &metrics.Metrics{},
-		udpTunnels: map[string]net.PacketConn{"tun-test": tunnelPC},
-		udpPeers:   make(map[string]map[string]time.Time),
+		log:            slog.New(slog.NewTextHandler(io.Discard, nil)),
+		metrics:        &metrics.Metrics{},
+		udpTunnels:     map[string]net.PacketConn{"tun-test": tunnelPC},
+		udpTunnelOwner: map[string]uint64{"tun-test": testSessionID},
+		udpPeers:       make(map[string]map[string]time.Time),
 	}
 
 	dgram := message.UDPDatagram{
@@ -39,7 +41,7 @@ func TestUDPReplyRequiresObservedPeer(t *testing.T) {
 	}
 
 	// A client-chosen target that was never observed must be dropped.
-	srv.handleUDPFromClient(dgram)
+	srv.handleUDPFromClient(testSessionID, dgram)
 	buf := make([]byte, 64)
 	_ = targetPC.SetReadDeadline(time.Now().Add(80 * time.Millisecond))
 	if n, _, err := targetPC.ReadFrom(buf); err == nil {
@@ -48,7 +50,7 @@ func TestUDPReplyRequiresObservedPeer(t *testing.T) {
 
 	// Once the address is observed on the tunnel, replies are allowed again.
 	srv.rememberUDPPeer("tun-test", targetPC.LocalAddr())
-	srv.handleUDPFromClient(dgram)
+	srv.handleUDPFromClient(testSessionID, dgram)
 	_ = targetPC.SetReadDeadline(time.Now().Add(time.Second))
 	n, _, err := targetPC.ReadFrom(buf)
 	if err != nil {
