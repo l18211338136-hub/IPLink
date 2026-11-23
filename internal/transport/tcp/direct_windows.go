@@ -110,6 +110,40 @@ func DialDirect(ctx context.Context, addr string, tlsCfg *tls.Config) (net.Conn,
 	return nil, lastErr
 }
 
+// ListenPacketDirect binds a UDP socket directly to the primary physical network
+// interface (via IP_UNICAST_IF), bypassing virtual TUN/VPN adapters on Windows.
+func ListenPacketDirect(ctx context.Context) (net.PacketConn, error) {
+	ifaces, err := findPhysicalInterfaces()
+	if err != nil {
+		return nil, fmt.Errorf("find physical interfaces: %w", err)
+	}
+	if len(ifaces) == 0 {
+		return nil, errors.New("no physical network interface available")
+	}
+
+	var lastErr error
+	for _, nic := range ifaces {
+		beIndex := hostToBigEndianUint32(nic.Index)
+		lc := net.ListenConfig{
+			Control: func(network, address string, c syscall.RawConn) error {
+				var sockErr error
+				if err := c.Control(func(fd uintptr) {
+					sockErr = syscall.SetsockoptInt(syscall.Handle(fd), syscall.IPPROTO_IP, ipUnicastIf, int(int32(beIndex)))
+				}); err != nil {
+					return err
+				}
+				return sockErr
+			},
+		}
+		pc, err := lc.ListenPacket(ctx, "udp4", net.JoinHostPort(nic.IPv4.String(), "0"))
+		if err == nil {
+			return pc, nil
+		}
+		lastErr = err
+	}
+	return nil, lastErr
+}
+
 func dialOnInterface(ctx context.Context, targetAddr string, nic physicalInterface, tlsCfg *tls.Config) (net.Conn, error) {
 	beIndex := hostToBigEndianUint32(nic.Index)
 	dialer := &net.Dialer{
@@ -151,8 +185,8 @@ func resolveViaOSOrDirect(ctx context.Context, host string, ifaces []physicalInt
 		}
 	}
 
-	// Fallback: query public DNS directly over the physical interface.
-	dnsServers := []string{"223.5.5.5:53", "119.29.29.29:53", "8.8.8.8:53"}
+	// Fallback: query physical NIC's DHCP/static DNS first (for intranet domains), then public DNS.
+	dnsServers := append(discoverPhysicalDNSServers(), "223.5.5.5:53", "119.29.29.29:53", "8.8.8.8:53")
 	for _, nic := range ifaces {
 		for _, dnsAddr := range dnsServers {
 			if ips, err := queryDNSOverInterface(ctx, host, dnsAddr, nic); err == nil && len(ips) > 0 {
@@ -161,6 +195,70 @@ func resolveViaOSOrDirect(ctx context.Context, host string, ifaces []physicalInt
 		}
 	}
 	return nil
+}
+
+func discoverPhysicalDNSServers() []string {
+	subkey, err := syscall.UTF16PtrFromString(`SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces`)
+	if err != nil {
+		return nil
+	}
+	var root syscall.Handle
+	if err := syscall.RegOpenKeyEx(syscall.HKEY_LOCAL_MACHINE, subkey, 0, syscall.KEY_READ, &root); err != nil {
+		return nil
+	}
+	defer syscall.RegCloseKey(root)
+
+	seen := make(map[string]struct{})
+	var out []string
+	nameBuf := make([]uint16, 256)
+	for idx := uint32(0); ; idx++ {
+		n := uint32(len(nameBuf))
+		if err := syscall.RegEnumKeyEx(root, idx, &nameBuf[0], &n, nil, nil, nil, nil); err != nil {
+			break
+		}
+		var ifKey syscall.Handle
+		if err := syscall.RegOpenKeyEx(root, &nameBuf[0], 0, syscall.KEY_READ, &ifKey); err != nil {
+			continue
+		}
+		for _, valName := range []string{"NameServer", "DhcpNameServer"} {
+			for _, ipStr := range readRegStringList(ifKey, valName) {
+				ip := net.ParseIP(ipStr)
+				if ip == nil {
+					continue
+				}
+				ip4 := ip.To4()
+				if ip4 == nil || ip4.IsLoopback() || ip4.IsUnspecified() || isFakeIPv4(ip4) {
+					continue
+				}
+				addr := net.JoinHostPort(ip4.String(), "53")
+				if _, ok := seen[addr]; !ok {
+					seen[addr] = struct{}{}
+					out = append(out, addr)
+				}
+			}
+		}
+		_ = syscall.RegCloseKey(ifKey)
+	}
+	return out
+}
+
+func readRegStringList(key syscall.Handle, valueName string) []string {
+	ptr, err := syscall.UTF16PtrFromString(valueName)
+	if err != nil {
+		return nil
+	}
+	var typ, size uint32
+	if err := syscall.RegQueryValueEx(key, ptr, nil, &typ, nil, &size); err != nil || size == 0 {
+		return nil
+	}
+	buf := make([]uint16, (size+1)/2)
+	if err := syscall.RegQueryValueEx(key, ptr, nil, &typ, (*byte)(unsafe.Pointer(&buf[0])), &size); err != nil {
+		return nil
+	}
+	raw := syscall.UTF16ToString(buf)
+	return strings.FieldsFunc(raw, func(r rune) bool {
+		return r == ',' || r == ' ' || r == ';'
+	})
 }
 
 func queryDNSOverInterface(ctx context.Context, host, dnsAddr string, nic physicalInterface) ([]net.IP, error) {

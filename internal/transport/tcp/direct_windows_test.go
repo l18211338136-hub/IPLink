@@ -3,6 +3,7 @@
 package tcp
 
 import (
+	"context"
 	"encoding/binary"
 	"net"
 	"testing"
@@ -73,5 +74,16 @@ func TestFindPhysicalInterfacesSmoke(t *testing.T) {
 		t.Fatalf("findPhysicalInterfaces failed: %v", err)
 	}
 	t.Logf("found %d physical interface(s): %+v", len(ifaces), ifaces)
+
+	dns := discoverPhysicalDNSServers()
+	t.Logf("discovered physical DNS servers: %v", dns)
+
+	if len(ifaces) > 0 {
+		pc, err := ListenPacketDirect(context.Background())
+		if err != nil {
+			t.Fatalf("ListenPacketDirect failed: %v", err)
+		}
+		_ = pc.Close()
+	}
 }
 

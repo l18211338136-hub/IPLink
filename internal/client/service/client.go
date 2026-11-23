@@ -193,11 +193,14 @@ func (c *Client) ConnectOnce(ctx context.Context) error {
 	if natAddr := c.natEndpoint(); c.cfg.Network.EnableP2P && natAddr != "" {
 		if nonce, err := auth.GenerateNonce(); err == nil {
 			probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-			if pub, err := discovery.DiscoverPublicAddr(probeCtx, nil, natAddr, c.cfg.Client.ID, nonce, c.dgramCipher); err == nil {
-				c.mu.Lock()
-				c.publicAddr = pub
-				c.mu.Unlock()
-				c.log.Debug("discovered public UDP address", "public_addr", pub)
+			if pc, pcErr := c.listenPacket(probeCtx); pcErr == nil {
+				if pub, err := discovery.DiscoverPublicAddr(probeCtx, pc, natAddr, c.cfg.Client.ID, nonce, c.dgramCipher); err == nil {
+					c.mu.Lock()
+					c.publicAddr = pub
+					c.mu.Unlock()
+					c.log.Debug("discovered public UDP address", "public_addr", pub)
+				}
+				_ = pc.Close()
 			}
 			cancel()
 		}
@@ -206,14 +209,27 @@ func (c *Client) ConnectOnce(ctx context.Context) error {
 	return nil
 }
 
-// dialAndAuth tries connecting normally first (or directly via physical NIC if
-// preferDirect was learned from a previous fallback) and automatically falls
-// back to DialDirect when a virtual/TUN adapter hijacks or breaks the route.
-func (c *Client) dialAndAuth(ctx context.Context, addr string, tlsConfig *tls.Config) (net.Conn, uint64, error) {
-	tryOnce := func(direct bool) (net.Conn, uint64, error) {
-		attemptCtx, cancel := context.WithTimeout(ctx, 6*time.Second)
-		defer cancel()
+func (c *Client) listenPacket(ctx context.Context) (net.PacketConn, error) {
+	if c.preferDirect.Load() {
+		if pc, err := tcptransport.ListenPacketDirect(ctx); err == nil {
+			return pc, nil
+		}
+	}
+	return net.ListenPacket("udp", ":0")
+}
 
+// dialAndAuth tries connecting normally first (or directly via physical NIC if
+// preferDirect was learned from a previous fallback) and races DialDirect after
+// a short stagger so TUN blackholes never stall the first connection for 6s.
+func (c *Client) dialAndAuth(ctx context.Context, addr string, tlsConfig *tls.Config) (net.Conn, uint64, error) {
+	type attemptRes struct {
+		direct bool
+		conn   net.Conn
+		sessID uint64
+		err    error
+	}
+
+	tryOnce := func(attemptCtx context.Context, direct bool) attemptRes {
 		var (
 			conn net.Conn
 			err  error
@@ -224,37 +240,85 @@ func (c *Client) dialAndAuth(ctx context.Context, addr string, tlsConfig *tls.Co
 			conn, err = tcptransport.Dial(attemptCtx, addr, tlsConfig)
 		}
 		if err != nil {
-			return nil, 0, fmt.Errorf("dial server %s: %w", addr, err)
+			return attemptRes{direct: direct, err: fmt.Errorf("dial server %s: %w", addr, err)}
 		}
 		sessID, err := c.authenticate(conn)
 		if err != nil {
 			_ = conn.Close()
-			return nil, 0, err
+			return attemptRes{direct: direct, err: err}
 		}
-		return conn, sessID, nil
+		return attemptRes{direct: direct, conn: conn, sessID: sessID}
 	}
+
+	raceCtx, cancelRace := context.WithTimeout(ctx, 7*time.Second)
+	defer cancelRace()
 
 	firstDirect := c.preferDirect.Load()
-	conn, sessID, err := tryOnce(firstDirect)
-	if err == nil {
-		return conn, sessID, nil
-	}
-	if ctx.Err() != nil || strings.Contains(err.Error(), "authentication rejected") {
-		return nil, 0, err
+	resCh := make(chan attemptRes, 2)
+	go func() { resCh <- tryOnce(raceCtx, firstDirect) }()
+
+	// Start the fallback attempt immediately if primary fails, or after 1.2s if primary is still pending.
+	fallbackStarted := false
+	startFallback := func() {
+		if fallbackStarted {
+			return
+		}
+		fallbackStarted = true
+		go func() { resCh <- tryOnce(raceCtx, !firstDirect) }()
 	}
 
-	conn2, sessID2, err2 := tryOnce(!firstDirect)
-	if err2 == nil {
-		c.preferDirect.Store(!firstDirect)
-		if !firstDirect {
-			c.log.Info("connected via physical interface (bypassed virtual/TUN adapter)", "server", addr)
+	timer := time.NewTimer(1200 * time.Millisecond)
+	defer timer.Stop()
+
+	var firstErr, secondErr error
+	received := 0
+	for received < 2 {
+		select {
+		case res := <-resCh:
+			received++
+			if res.err == nil {
+				cancelRace()
+				if received == 1 && fallbackStarted {
+					go func() {
+						if loser := <-resCh; loser.conn != nil {
+							_ = loser.conn.Close()
+						}
+					}()
+				}
+				c.preferDirect.Store(res.direct)
+				if res.direct && !firstDirect {
+					c.log.Info("connected via physical interface (bypassed virtual/TUN adapter)", "server", addr)
+				}
+				return res.conn, res.sessID, nil
+			}
+			if res.direct == firstDirect {
+				firstErr = res.err
+				if ctx.Err() != nil || strings.Contains(res.err.Error(), "authentication rejected") {
+					cancelRace()
+					return nil, 0, res.err
+				}
+				startFallback()
+			} else {
+				secondErr = res.err
+				if !fallbackStarted {
+					break
+				}
+			}
+		case <-timer.C:
+			startFallback()
 		}
-		return conn2, sessID2, nil
+		if received == 1 && !fallbackStarted {
+			continue
+		}
 	}
-	if !firstDirect {
-		return nil, 0, err
+
+	if !firstDirect && firstErr != nil {
+		return nil, 0, firstErr
 	}
-	return nil, 0, err2
+	if secondErr != nil {
+		return nil, 0, secondErr
+	}
+	return nil, 0, firstErr
 }
 
 // Start connects, authenticates, starts background loops, and registers configured tunnels.
@@ -608,7 +672,7 @@ func (c *Client) IncomingPeer(peerID string) *PeerChannel {
 
 // ConnectPeer attempts Direct-First UDP hole punching to targetClientID, falling back to Server Relay.
 func (c *Client) ConnectPeer(ctx context.Context, targetClientID string) (*PeerChannel, error) {
-	pc, err := net.ListenPacket("udp", ":0")
+	pc, err := c.listenPacket(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -940,7 +1004,7 @@ func (c *Client) handleIncomingPeerConnect(ctx context.Context, info message.Pee
 	if !c.cfg.Network.EnableP2P {
 		return
 	}
-	pc, err := net.ListenPacket("udp", ":0")
+	pc, err := c.listenPacket(ctx)
 	if err != nil {
 		return
 	}
@@ -959,7 +1023,7 @@ func (c *Client) handleIncomingRelay(notify message.RelayAllocNotify) {
 	if c.IncomingPeer(notify.FromClientID) != nil {
 		return
 	}
-	pc, err := net.ListenPacket("udp", ":0")
+	pc, err := c.listenPacket(context.Background())
 	if err != nil {
 		return
 	}
