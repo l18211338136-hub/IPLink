@@ -10,7 +10,7 @@ import (
 // Listen starts a TCP listener (or TLS 1.3 listener when tlsCfg is non-nil) on addr.
 func Listen(ctx context.Context, addr string, tlsCfg *tls.Config) (net.Listener, error) {
 	lc := net.ListenConfig{
-		KeepAlive: 30 * time.Second,
+		KeepAlive: 15 * time.Second,
 	}
 	ln, err := lc.Listen(ctx, "tcp", addr)
 	if err != nil {
@@ -26,7 +26,7 @@ func Listen(ctx context.Context, addr string, tlsCfg *tls.Config) (net.Listener,
 func Dial(ctx context.Context, addr string, tlsCfg *tls.Config) (net.Conn, error) {
 	dialer := &net.Dialer{
 		Timeout:   10 * time.Second,
-		KeepAlive: 30 * time.Second,
+		KeepAlive: 15 * time.Second,
 	}
 	if tlsCfg != nil {
 		tlsDialer := &tls.Dialer{

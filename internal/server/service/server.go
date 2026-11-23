@@ -33,7 +33,7 @@ import (
 
 const (
 	authTimeout      = 10 * time.Second
-	heartbeatTimeout = 60 * time.Second
+	heartbeatTimeout = 90 * time.Second
 	streamQueueSize  = 64
 	readChunkSize    = 32 * 1024
 	udpPeerTTL       = 2 * time.Minute
@@ -326,6 +326,8 @@ func (s *Server) handleControlConn(ctx context.Context, conn net.Conn) {
 			}
 			return
 		}
+		// 收到客户端任何合法帧均刷新会话活跃时间，防止高吞吐隧道数据阻塞心跳帧导致 ReapExpired 误杀会话。
+		sess.TouchHeartbeat()
 		s.dispatchFrame(ctx, sess, f)
 	}
 }
@@ -510,7 +512,7 @@ func (s *Server) handleTunnelCreate(ctx context.Context, sess *session.Session, 
 
 	switch proto {
 	case "tcp":
-		ln, err := net.Listen("tcp", req.RemoteAddr)
+		ln, err := listenTCPWithRetry(ctx, req.RemoteAddr)
 		if err != nil {
 			s.sendTunnelCreateErr(sess, reqID, protocol.ErrTunnelCreateFailed, err.Error())
 			return
@@ -546,7 +548,7 @@ func (s *Server) handleTunnelCreate(ctx context.Context, sess *session.Session, 
 		}()
 
 	case "udp":
-		pc, err := net.ListenPacket("udp", req.RemoteAddr)
+		pc, err := listenUDPWithRetry(ctx, req.RemoteAddr)
 		if err != nil {
 			s.sendTunnelCreateErr(sess, reqID, protocol.ErrTunnelCreateFailed, err.Error())
 			return
@@ -639,6 +641,48 @@ func (s *Server) sendTunnelCreateErr(sess *session.Session, reqID uint64, code p
 	if err == nil {
 		_ = sess.SendFrame(ack)
 	}
+}
+
+// listenTCPWithRetry retries binding briefly when a client reconnects and its
+// previous session's tunnel port is still being torn down by the OS or old session.
+func listenTCPWithRetry(ctx context.Context, addr string) (net.Listener, error) {
+	var lastErr error
+	for i := 0; i < 6; i++ {
+		ln, err := net.Listen("tcp", addr)
+		if err == nil {
+			return ln, nil
+		}
+		lastErr = err
+		if i == 5 {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	return nil, lastErr
+}
+
+func listenUDPWithRetry(ctx context.Context, addr string) (net.PacketConn, error) {
+	var lastErr error
+	for i := 0; i < 6; i++ {
+		pc, err := net.ListenPacket("udp", addr)
+		if err == nil {
+			return pc, nil
+		}
+		lastErr = err
+		if i == 5 {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	return nil, lastErr
 }
 
 func (s *Server) acceptTCPTunnel(ctx context.Context, sess *session.Session, tunID, localAddr string, ln net.Listener) {

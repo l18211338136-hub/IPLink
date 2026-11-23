@@ -93,7 +93,11 @@ func (a *App) GetConfig() iplinkclient.Config {
 		}
 	}
 	cfg := iplinkclient.DefaultConfig()
-	cfg.Client.ID = "windows-client-001"
+	if host, err := os.Hostname(); err == nil && strings.TrimSpace(host) != "" {
+		cfg.Client.ID = "windows-" + strings.ToLower(strings.TrimSpace(host))
+	} else {
+		cfg.Client.ID = "windows-client-001"
+	}
 	cfg.Security.AllowedTargets = []string{"127.0.0.1:*"}
 	return cfg
 }
