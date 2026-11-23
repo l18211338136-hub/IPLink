@@ -99,10 +99,11 @@ func (s *Session) Close() error {
 }
 
 // Manager manages active client sessions in a concurrency-safe manner.
+// Multiple concurrent sessions may share the same clientID without kicking each other.
 type Manager struct {
 	mu       sync.RWMutex
 	byID     map[uint64]*Session
-	byClient map[string]*Session
+	byClient map[string][]*Session
 	nextID   atomic.Uint64
 	metrics  *metrics.Metrics
 }
@@ -111,12 +112,13 @@ type Manager struct {
 func NewManager(m *metrics.Metrics) *Manager {
 	return &Manager{
 		byID:     make(map[uint64]*Session),
-		byClient: make(map[string]*Session),
+		byClient: make(map[string][]*Session),
 		metrics:  m,
 	}
 }
 
-// Create registers a new session, closing any previous session for the same clientID.
+// Create registers a new session without closing existing active sessions of the same clientID,
+// allowing multiple client instances to stay connected concurrently.
 func (m *Manager) Create(clientID string, conn net.Conn, localAddr string) *Session {
 	id := m.nextID.Add(1)
 	s := &Session{
@@ -129,12 +131,8 @@ func (m *Manager) Create(clientID string, conn net.Conn, localAddr string) *Sess
 	s.TouchHeartbeat()
 
 	m.mu.Lock()
-	if old, exists := m.byClient[clientID]; exists {
-		delete(m.byID, old.ID)
-		_ = old.Close()
-	}
 	m.byID[id] = s
-	m.byClient[clientID] = s
+	m.byClient[clientID] = append(m.byClient[clientID], s)
 	m.updateMetricsLocked()
 	m.mu.Unlock()
 
@@ -149,12 +147,16 @@ func (m *Manager) Get(id uint64) (*Session, bool) {
 	return s, ok
 }
 
-// GetByClientID retrieves a session by client ID.
+// GetByClientID retrieves the most recently created active session for clientID.
 func (m *Manager) GetByClientID(clientID string) (*Session, bool) {
 	m.mu.RLock()
-	s, ok := m.byClient[clientID]
+	list := m.byClient[clientID]
+	var s *Session
+	if len(list) > 0 {
+		s = list[len(list)-1]
+	}
 	m.mu.RUnlock()
-	return s, ok
+	return s, s != nil
 }
 
 // Remove deletes and closes a session if it is still registered.
@@ -163,8 +165,17 @@ func (m *Manager) Remove(id uint64) {
 	s, ok := m.byID[id]
 	if ok {
 		delete(m.byID, id)
-		if cur, exists := m.byClient[s.ClientID]; exists && cur.ID == id {
+		list := m.byClient[s.ClientID]
+		for i, cur := range list {
+			if cur.ID == id {
+				list = append(list[:i], list[i+1:]...)
+				break
+			}
+		}
+		if len(list) == 0 {
 			delete(m.byClient, s.ClientID)
+		} else {
+			m.byClient[s.ClientID] = list
 		}
 		m.updateMetricsLocked()
 	}
@@ -227,7 +238,7 @@ func (m *Manager) CloseAll() {
 		sessions = append(sessions, s)
 	}
 	m.byID = make(map[uint64]*Session)
-	m.byClient = make(map[string]*Session)
+	m.byClient = make(map[string][]*Session)
 	m.updateMetricsLocked()
 	m.mu.Unlock()
 

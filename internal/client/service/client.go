@@ -32,8 +32,8 @@ import (
 )
 
 const (
-	heartbeatInterval   = 20 * time.Second
-	missedPongLimit     = 3 // 连续 3 次心跳无 PONG 判定链路半开（默认 60s）
+	heartbeatInterval   = 15 * time.Second
+	missedPongLimit     = 4 // 连续 4 次心跳周期无任何下行帧判定链路半开（60s）
 	streamQueueSize     = 64
 	readChunkSize       = 32 * 1024
 	udpIdleTimeout      = 60 * time.Second
@@ -287,18 +287,37 @@ func (c *Client) Start(ctx context.Context) (<-chan error, error) {
 		c.reapIdleUDP(serveCtx)
 	}()
 
+	var registeredCount int
+	var lastTunnelErr error
 	for _, t := range c.cfg.Tunnels {
 		if !c.tunnelEnabled(t) {
 			c.log.Debug("skipping tunnel disabled by network config", "tunnel", t.Name, "protocol", t.Protocol)
 			continue
 		}
 		if _, err := c.RegisterTunnel(serveCtx, t); err != nil {
-			cancel()
-			c.cleanupSession()
-			wg.Wait()
-			return nil, err
+			lastTunnelErr = err
+			// 若因权限策略拒绝（如 local_addr 不在白名单）或连接本身已断，立即返回错误；
+			// 若仅因远端端口已被其他在线客户端占用，记录警告日志并保持当前客户端在线，避免陷入断线重连死循环。
+			var srvErr *ServerError
+			if errors.As(err, &srvErr) && srvErr.Code == protocol.ErrTargetDenied {
+				cancel()
+				c.cleanupSession()
+				wg.Wait()
+				return nil, err
+			}
+			if !strings.Contains(err.Error(), "address already in use") && !strings.Contains(err.Error(), "already registered") {
+				cancel()
+				c.cleanupSession()
+				wg.Wait()
+				return nil, err
+			}
+			c.log.Warn("tunnel remote port already in use on server, keeping session alive", "tunnel", t.Name, "remote", t.RemoteAddr, "err", err)
+			continue
 		}
+		registeredCount++
 	}
+	_ = registeredCount
+	_ = lastTunnelErr
 
 	go func() {
 		var retErr error
@@ -857,6 +876,8 @@ func (c *Client) readLoop(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
+		// 收到任何合法下行帧均刷新链路存活时间戳，避免大流量传输阻塞 PONG 时误判半开。
+		c.lastPong.Store(time.Now().UnixNano())
 		if f.Header.RequestID != 0 {
 			c.reqMu.Lock()
 			ch, ok := c.pending[f.Header.RequestID]
