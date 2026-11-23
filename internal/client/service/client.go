@@ -89,6 +89,8 @@ type Client struct {
 
 	// dgramCipher 加密 NAT 探测、P2P 打洞与 PeerChannel/Relay 数据报。
 	dgramCipher *clientcrypto.DatagramCipher
+
+	preferDirect atomic.Bool
 }
 
 type localStream struct {
@@ -173,14 +175,8 @@ func (c *Client) ConnectOnce(ctx context.Context) error {
 		tlsConfig = clientcrypto.BuildClientTLSConfig(c.cfg.Security.TLSInsecureSkipVerify)
 	}
 	addr := fmt.Sprintf("%s:%d", c.cfg.Server.Address, c.cfg.Server.Port)
-	conn, err := tcptransport.Dial(ctx, addr, tlsConfig)
+	conn, sessID, err := c.dialAndAuth(ctx, addr, tlsConfig)
 	if err != nil {
-		return fmt.Errorf("dial server %s: %w", addr, err)
-	}
-
-	sessID, err := c.authenticate(conn)
-	if err != nil {
-		_ = conn.Close()
 		return err
 	}
 
@@ -208,6 +204,57 @@ func (c *Client) ConnectOnce(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// dialAndAuth tries connecting normally first (or directly via physical NIC if
+// preferDirect was learned from a previous fallback) and automatically falls
+// back to DialDirect when a virtual/TUN adapter hijacks or breaks the route.
+func (c *Client) dialAndAuth(ctx context.Context, addr string, tlsConfig *tls.Config) (net.Conn, uint64, error) {
+	tryOnce := func(direct bool) (net.Conn, uint64, error) {
+		attemptCtx, cancel := context.WithTimeout(ctx, 6*time.Second)
+		defer cancel()
+
+		var (
+			conn net.Conn
+			err  error
+		)
+		if direct {
+			conn, err = tcptransport.DialDirect(attemptCtx, addr, tlsConfig)
+		} else {
+			conn, err = tcptransport.Dial(attemptCtx, addr, tlsConfig)
+		}
+		if err != nil {
+			return nil, 0, fmt.Errorf("dial server %s: %w", addr, err)
+		}
+		sessID, err := c.authenticate(conn)
+		if err != nil {
+			_ = conn.Close()
+			return nil, 0, err
+		}
+		return conn, sessID, nil
+	}
+
+	firstDirect := c.preferDirect.Load()
+	conn, sessID, err := tryOnce(firstDirect)
+	if err == nil {
+		return conn, sessID, nil
+	}
+	if ctx.Err() != nil || strings.Contains(err.Error(), "authentication rejected") {
+		return nil, 0, err
+	}
+
+	conn2, sessID2, err2 := tryOnce(!firstDirect)
+	if err2 == nil {
+		c.preferDirect.Store(!firstDirect)
+		if !firstDirect {
+			c.log.Info("connected via physical interface (bypassed virtual/TUN adapter)", "server", addr)
+		}
+		return conn2, sessID2, nil
+	}
+	if !firstDirect {
+		return nil, 0, err
+	}
+	return nil, 0, err2
 }
 
 // Start connects, authenticates, starts background loops, and registers configured tunnels.
