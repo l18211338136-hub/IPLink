@@ -20,6 +20,7 @@ import (
 	"iplink/internal/metrics"
 	"iplink/internal/nat/discovery"
 	"iplink/internal/nat/punching"
+	"iplink/internal/p2p"
 	"iplink/internal/protocol/codec"
 	"iplink/internal/protocol/frame"
 	"iplink/internal/protocol/message"
@@ -313,6 +314,9 @@ func (c *Client) dialAndAuth(ctx context.Context, addr string, tlsConfig *tls.Co
 	}
 
 	if !firstDirect && firstErr != nil {
+		if secondErr != nil {
+			return nil, 0, fmt.Errorf("%w (direct fallback: %v)", firstErr, secondErr)
+		}
 		return nil, 0, firstErr
 	}
 	if secondErr != nil {
@@ -661,6 +665,139 @@ func (c *Client) RegisterIncoming(peerID string, ch *PeerChannel) {
 	}
 	c.peerMu.Unlock()
 	_ = ch.Close()
+}
+
+// PeerForwarder exposes a local TCP listener that tunnels connections over a
+// reliable P2P/Relay multiplexed stream to a remote client's target address.
+type PeerForwarder struct {
+	Mode       string
+	ListenAddr string
+	RTT        time.Duration
+
+	ln     net.Listener
+	mux    *p2p.Mux
+	ch     *PeerChannel
+	cancel context.CancelFunc
+	done   chan struct{}
+}
+
+// Close stops the local listener and tears down the P2P/Relay session.
+func (f *PeerForwarder) Close() error {
+	f.cancel()
+	_ = f.ln.Close()
+	_ = f.mux.Close()
+	return f.ch.Close()
+}
+
+// Done returns a channel closed when the forwarder stops.
+func (f *PeerForwarder) Done() <-chan struct{} {
+	return f.done
+}
+
+// ForwardPeerTCP connects to targetClientID via P2P (or Relay fallback) and
+// listens on listenAddr, forwarding each accepted TCP connection to remoteTargetAddr.
+func (c *Client) ForwardPeerTCP(ctx context.Context, targetClientID, listenAddr, remoteTargetAddr string) (*PeerForwarder, error) {
+	ch, err := c.ConnectPeer(ctx, targetClientID)
+	if err != nil {
+		return nil, err
+	}
+
+	var rtt time.Duration
+	if pingRTT, err := ch.Ping(ctx); err == nil {
+		rtt = pingRTT
+	}
+
+	ln, err := net.Listen("tcp", listenAddr)
+	if err != nil {
+		_ = ch.Close()
+		return nil, fmt.Errorf("listen %s: %w", listenAddr, err)
+	}
+
+	fwdCtx, cancel := context.WithCancel(context.Background())
+	mux := p2p.NewMux(fwdCtx, ch, true)
+	fwd := &PeerForwarder{
+		Mode:       ch.Mode,
+		ListenAddr: ln.Addr().String(),
+		RTT:        rtt,
+		ln:         ln,
+		mux:        mux,
+		ch:         ch,
+		cancel:     cancel,
+		done:       make(chan struct{}),
+	}
+
+	go func() {
+		defer close(fwd.done)
+		defer func() {
+			_ = ln.Close()
+			_ = mux.Close()
+			_ = ch.Close()
+		}()
+		for {
+			localConn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(lc net.Conn) {
+				defer lc.Close()
+				openCtx, openCancel := context.WithTimeout(fwdCtx, 8*time.Second)
+				stream, err := mux.OpenStream(openCtx, remoteTargetAddr)
+				openCancel()
+				if err != nil {
+					c.log.Debug("p2p open stream failed", "peer", targetClientID, "target", remoteTargetAddr, "err", err)
+					return
+				}
+				defer stream.Close()
+				pipeBidirectional(lc, stream)
+			}(localConn)
+		}
+	}()
+
+	return fwd, nil
+}
+
+func (c *Client) servePeerMux(peerID string, ch *PeerChannel) {
+	mux := p2p.NewMux(context.Background(), ch, false)
+	defer mux.Close()
+
+	for {
+		stream, targetAddr, err := mux.Accept(context.Background())
+		if err != nil {
+			return
+		}
+		go func(s net.Conn, target string) {
+			defer s.Close()
+			if err := c.validator.Allow(target); err != nil {
+				c.log.Warn("blocked p2p target", "peer", peerID, "target", target, "err", err)
+				return
+			}
+			dialCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			localConn, err := (&net.Dialer{}).DialContext(dialCtx, "tcp", target)
+			cancel()
+			if err != nil {
+				c.log.Debug("p2p local dial failed", "peer", peerID, "target", target, "err", err)
+				return
+			}
+			defer localConn.Close()
+			pipeBidirectional(s, localConn)
+		}(stream, targetAddr)
+	}
+}
+
+func pipeBidirectional(a, b net.Conn) {
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		_, _ = io.Copy(a, b)
+		_ = a.Close()
+	}()
+	go func() {
+		defer wg.Done()
+		_, _ = io.Copy(b, a)
+		_ = b.Close()
+	}()
+	wg.Wait()
 }
 
 // IncomingPeer returns the channel opened by peerID, if any.
@@ -1016,6 +1153,9 @@ func (c *Client) handleIncomingPeerConnect(ctx context.Context, info message.Pee
 	}
 	ch := newPeerChannel("p2p", info.PeerID, pc, peerAddr, "", "", c.dgramCipher)
 	c.RegisterIncoming(info.PeerID, ch)
+	if c.IncomingPeer(info.PeerID) == ch {
+		go c.servePeerMux(info.PeerID, ch)
+	}
 	c.log.Info("incoming P2P hole punch succeeded", "peer", info.PeerID, "peer_addr", peerAddr.String())
 }
 
@@ -1034,6 +1174,9 @@ func (c *Client) handleIncomingRelay(notify message.RelayAllocNotify) {
 	}
 	ch := newPeerChannel("relay", notify.FromClientID, pc, relayAddr, notify.RelaySessionID, notify.RelayToken, c.dgramCipher)
 	c.RegisterIncoming(notify.FromClientID, ch)
+	if c.IncomingPeer(notify.FromClientID) == ch {
+		go c.servePeerMux(notify.FromClientID, ch)
+	}
 	_ = ch.Send([]byte(peerRelayJoinPrefix + notify.RelaySessionID))
 	c.log.Info("joined relay session", "peer", notify.FromClientID, "relay", notify.RelaySessionID)
 }

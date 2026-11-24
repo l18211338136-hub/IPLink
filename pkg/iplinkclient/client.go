@@ -30,6 +30,9 @@ type ServerInfo = message.ServerInfo
 // PeerChannel aliases a P2P or Relay channel established with another client.
 type PeerChannel = service.PeerChannel
 
+// PeerForwarder aliases a local TCP listener forwarding over a P2P/Relay stream.
+type PeerForwarder = service.PeerForwarder
+
 // DefaultConfig returns a ClientConfig with sensible defaults.
 func DefaultConfig() Config {
 	return config.DefaultClientConfig()
@@ -108,4 +111,10 @@ func (c *Client) ConnectPeer(ctx context.Context, targetClientID string) (*PeerC
 // IncomingPeer returns the channel opened by a remote peer, if any.
 func (c *Client) IncomingPeer(peerID string) *PeerChannel {
 	return c.svc.IncomingPeer(peerID)
+}
+
+// ForwardPeerTCP connects to targetClientID via P2P (or Relay fallback) and
+// listens on listenAddr, forwarding TCP connections to remoteTargetAddr.
+func (c *Client) ForwardPeerTCP(ctx context.Context, targetClientID, listenAddr, remoteTargetAddr string) (*PeerForwarder, error) {
+	return c.svc.ForwardPeerTCP(ctx, targetClientID, listenAddr, remoteTargetAddr)
 }

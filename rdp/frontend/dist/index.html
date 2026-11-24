@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>IP Link 远程桌面</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #0f172a;
+      color: #e2e8f0;
+      padding: 20px;
+      line-height: 1.5;
+    }
+    .container { max-width: 900px; margin: 0 auto; display: flex; flex-direction: column; gap: 16px; }
+    .header { display: flex; justify-content: space-between; align-items: center; }
+    .header h1 { font-size: 20px; font-weight: 600; color: #f8fafc; }
+    .badge {
+      padding: 4px 10px; border-radius: 999px; font-size: 12px; font-weight: 600;
+      background: #334155; color: #cbd5e1;
+    }
+    .badge.connected { background: #065f46; color: #6ee7b7; }
+    .badge.connecting { background: #854d0e; color: #fde047; }
+    .card {
+      background: #1e293b; border: 1px solid #334155; border-radius: 10px; padding: 16px;
+    }
+    .card h2 { font-size: 14px; color: #94a3b8; margin-bottom: 12px; text-transform: uppercase; letter-spacing: 0.05em; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; }
+    label { display: block; font-size: 12px; color: #94a3b8; margin-bottom: 4px; }
+    input[type="text"], input[type="number"], input[type="password"] {
+      width: 100%; padding: 8px 10px; border-radius: 6px; border: 1px solid #475569;
+      background: #0f172a; color: #f8fafc; font-size: 13px;
+    }
+    .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-top: 12px; }
+    button {
+      padding: 8px 16px; border-radius: 6px; border: none; font-size: 13px; font-weight: 600;
+      cursor: pointer; transition: opacity 0.15s;
+    }
+    button:hover { opacity: 0.9; }
+    button:disabled { opacity: 0.45; cursor: not-allowed; }
+    .btn-primary { background: #3b82f6; color: #fff; }
+    .btn-success { background: #10b981; color: #fff; }
+    .btn-danger { background: #ef4444; color: #fff; }
+    .btn-ghost { background: #334155; color: #e2e8f0; }
+    .peers-list { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+    .peer-chip {
+      background: #0f172a; border: 1px solid #475569; border-radius: 6px; padding: 4px 10px;
+      font-size: 12px; cursor: pointer; color: #93c5fd;
+    }
+    .peer-chip:hover { border-color: #3b82f6; }
+    .status-box {
+      background: #0f172a; border: 1px solid #334155; border-radius: 8px; padding: 12px;
+      font-size: 13px; display: flex; justify-content: space-between; align-items: center;
+    }
+    .logs {
+      background: #020617; border: 1px solid #334155; border-radius: 8px; padding: 10px;
+      height: 180px; overflow-y: auto; font-family: Consolas, monospace; font-size: 12px; color: #94a3b8;
+    }
+    .check { display: flex; align-items: center; gap: 6px; font-size: 13px; color: #cbd5e1; margin-top: 20px; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <h1>IP Link P2P 远程桌面</h1>
+      <span id="serverBadge" class="badge">未连接服务端</span>
+    </div>
+
+    <div class="card">
+      <h2>1. 服务端信令连接</h2>
+      <div class="grid">
+        <div>
+          <label>服务端地址</label>
+          <input id="serverAddress" type="text" placeholder="例如 1.2.3.4 或域名" />
+        </div>
+        <div>
+          <label>端口</label>
+          <input id="serverPort" type="number" value="29000" />
+        </div>
+        <div>
+          <label>认证 Token</label>
+          <input id="token" type="password" placeholder="服务端 Token" />
+        </div>
+        <div>
+          <label>本机 Client ID</label>
+          <input id="clientID" type="text" placeholder="自动生成" />
+        </div>
+        <div class="check">
+          <input id="tlsEnabled" type="checkbox" />
+          <span>启用 TLS</span>
+          <input id="tlsInsecure" type="checkbox" style="margin-left:8px" />
+          <span>跳过证书校验</span>
+        </div>
+      </div>
+      <div class="row">
+        <button id="btnConnectServer" class="btn-primary" onclick="connectServer()">连接服务端</button>
+        <button id="btnDisconnectServer" class="btn-danger" onclick="disconnectServer()" disabled>断开服务端</button>
+        <button id="btnRefreshPeers" class="btn-ghost" onclick="refreshPeers()" disabled>刷新在线设备</button>
+      </div>
+      <div id="peersList" class="peers-list"></div>
+    </div>
+
+    <div class="card">
+      <h2>2. P2P 远程桌面连接</h2>
+      <div class="grid">
+        <div>
+          <label>目标设备 Client ID</label>
+          <input id="targetClientID" type="text" placeholder="点击上方在线设备或手动输入" />
+        </div>
+        <div>
+          <label>被控端桌面端口</label>
+          <input id="remoteAddr" type="text" value="127.0.0.1:3389" />
+        </div>
+      </div>
+      <div class="row">
+        <button id="btnConnectRDP" class="btn-success" onclick="connectRDP()" disabled>P2P 连接远程桌面 (mstsc)</button>
+        <button id="btnDisconnectRDP" class="btn-danger" onclick="disconnectRDP()" disabled>断开远程桌面通道</button>
+      </div>
+      <div id="tunnelBox" class="status-box" style="margin-top:12px; display:none;">
+        <span id="tunnelInfo"></span>
+        <span id="tunnelBadge" class="badge connected"></span>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>运行日志</h2>
+      <div id="logs" class="logs"></div>
+    </div>
+  </div>
+
+  <script>
+    const go = () => window.go.main.App;
+
+    async function init() {
+      const cfg = await go().GetConfig();
+      document.getElementById('serverAddress').value = cfg.server_address || '';
+      document.getElementById('serverPort').value = cfg.server_port || 7000;
+      document.getElementById('token').value = cfg.token || '';
+      document.getElementById('clientID').value = cfg.client_id || '';
+      document.getElementById('tlsEnabled').checked = !!cfg.tls_enabled;
+      document.getElementById('tlsInsecure').checked = !!cfg.tls_insecure;
+      document.getElementById('targetClientID').value = cfg.target_client_id || '';
+      document.getElementById('remoteAddr').value = cfg.remote_addr || '127.0.0.1:3389';
+      setInterval(pollState, 1000);
+    }
+
+    async function connectServer() {
+      try {
+        await go().ConnectServer({
+          server_address: document.getElementById('serverAddress').value.trim(),
+          server_port: parseInt(document.getElementById('serverPort').value, 10) || 7000,
+          token: document.getElementById('token').value,
+          client_id: document.getElementById('clientID').value.trim(),
+          tls_enabled: document.getElementById('tlsEnabled').checked,
+          tls_insecure: document.getElementById('tlsInsecure').checked,
+          target_client_id: document.getElementById('targetClientID').value.trim(),
+          remote_addr: document.getElementById('remoteAddr').value.trim(),
+        });
+      } catch (e) {
+        alert(e);
+      }
+    }
+
+    async function disconnectServer() {
+      await go().DisconnectServer();
+      document.getElementById('peersList').innerHTML = '';
+    }
+
+    async function refreshPeers() {
+      try {
+        const peers = await go().ListPeers();
+        const box = document.getElementById('peersList');
+        box.innerHTML = '';
+        if (!peers || peers.length === 0) {
+          box.innerHTML = '<span style="font-size:12px;color:#64748b;">暂无其他在线设备</span>';
+          return;
+        }
+        peers.forEach(p => {
+          const btn = document.createElement('button');
+          btn.className = 'peer-chip';
+          btn.textContent = p.client_id + (p.has_nat ? ' (可P2P)' : '');
+          btn.onclick = () => { document.getElementById('targetClientID').value = p.client_id; };
+          box.appendChild(btn);
+        });
+      } catch (e) {
+        alert(e);
+      }
+    }
+
+    async function connectRDP() {
+      try {
+        const target = document.getElementById('targetClientID').value.trim();
+        const remote = document.getElementById('remoteAddr').value.trim();
+        await go().ConnectRemoteDesktop(target, remote);
+        await pollState();
+      } catch (e) {
+        alert(e);
+      }
+    }
+
+    async function disconnectRDP() {
+      await go().DisconnectRemoteDesktop();
+      await pollState();
+    }
+
+    async function pollState() {
+      const st = await go().GetState();
+      const badge = document.getElementById('serverBadge');
+      const isConn = st.server_state === 'connected';
+      const isConnecting = st.server_state === 'connecting';
+
+      badge.className = 'badge ' + (isConn ? 'connected' : isConnecting ? 'connecting' : '');
+      badge.textContent = isConn ? '服务端已连接' : isConnecting ? '正在连接...' : '未连接服务端';
+
+      document.getElementById('btnConnectServer').disabled = isConn || isConnecting;
+      document.getElementById('btnDisconnectServer').disabled = !isConn && !isConnecting;
+      document.getElementById('btnRefreshPeers').disabled = !isConn;
+      document.getElementById('btnConnectRDP').disabled = !isConn;
+      document.getElementById('btnDisconnectRDP').disabled = !st.tunnel_active;
+
+      const tBox = document.getElementById('tunnelBox');
+      if (st.tunnel_active) {
+        tBox.style.display = 'flex';
+        document.getElementById('tunnelInfo').textContent =
+          `本地映射: ${st.listen_addr} → ${st.target_client_id} (${st.remote_addr}) | 延迟: ${st.rtt_ms} ms`;
+        document.getElementById('tunnelBadge').textContent = (st.tunnel_mode || 'p2p').toUpperCase();
+      } else {
+        tBox.style.display = 'none';
+      }
+
+      const logsEl = document.getElementById('logs');
+      logsEl.innerHTML = (st.logs || []).map(l => `<div>${l.replace(/</g, '&lt;')}</div>`).join('');
+      logsEl.scrollTop = logsEl.scrollHeight;
+    }
+
+    window.addEventListener('DOMContentLoaded', init);
+  </script>
+</body>
+</html>
+
