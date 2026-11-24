@@ -196,9 +196,9 @@
       </div>
       <div class="right">
         <select id="qualityPreset" onchange="applyQualityPreset()">
-          <option value="fast">流畅 (50% / 20fps)</option>
-          <option value="balanced" selected>均衡 (75% / 18fps)</option>
-          <option value="hd">高清 (100% / 15fps)</option>
+          <option value="fast">流畅 (65% / 20fps)</option>
+          <option value="balanced">均衡 (85% / 18fps)</option>
+          <option value="hd" selected>超清文字 (100% 原生 / 15fps)</option>
         </select>
         <button class="btn-primary" onclick="sendFile()">传文件</button>
         <button class="btn-ghost" onclick="refreshScreen()">刷新画面</button>
@@ -476,6 +476,7 @@
             if (canvas.width !== w || canvas.height !== h) {
               canvas.width = w;
               canvas.height = h;
+              canvas.style.aspectRatio = `${w} / ${h}`;
             }
             ctx.drawImage(bmp, 0, 0, w, h);
             bmp.close();
@@ -497,7 +498,9 @@
             const len = view.getUint32(off + 8, false);
             off += 12;
             if (off + len > buf.byteLength) break;
-            const blob = new Blob([buf.slice(off, off + len)], { type: 'image/jpeg' });
+            const slice = buf.slice(off, off + len);
+            const mime = (view.getUint8(off) === 0x89) ? 'image/png' : 'image/jpeg';
+            const blob = new Blob([slice], { type: mime });
             off += len;
             jobs.push(createImageBitmap(blob).then(bmp => ({ bmp, x, y, w, h })));
           }
@@ -506,6 +509,7 @@
             if (canvas.width !== sw || canvas.height !== sh) {
               canvas.width = sw;
               canvas.height = sh;
+              canvas.style.aspectRatio = `${sw} / ${sh}`;
             }
             for (const t of tiles) {
               ctx.drawImage(t.bmp, t.x, t.y, t.w, t.h);
@@ -551,11 +555,11 @@
     function applyQualityPreset() {
       const val = document.getElementById('qualityPreset').value;
       if (val === 'fast') {
-        sendInput({ t: 'config', scale: 0.5, quality: 45, fps: 20 });
-      } else if (val === 'hd') {
-        sendInput({ t: 'config', scale: 1.0, quality: 72, fps: 15 });
+        sendInput({ t: 'config', scale: 0.65, quality: 48, fps: 20 });
+      } else if (val === 'balanced') {
+        sendInput({ t: 'config', scale: 0.85, quality: 58, fps: 18 });
       } else {
-        sendInput({ t: 'config', scale: 0.75, quality: 55, fps: 18 });
+        sendInput({ t: 'config', scale: 1.0, quality: 72, fps: 15 });
       }
     }
 

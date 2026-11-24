@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"image"
 	"image/jpeg"
+	"image/png"
 	"net"
 	"runtime"
 	"sync"
@@ -261,9 +262,9 @@ func (h *ScreenHost) serveConn(conn net.Conn) {
 	}
 
 	var cfgMu sync.Mutex
-	quality := 55
-	fps := 18
-	scale := 0.75
+	quality := 68
+	fps := 15
+	scale := 1.0
 	forceFull := false
 
 	done := make(chan struct{})
@@ -409,7 +410,8 @@ func (h *ScreenHost) serveConn(conn net.Conn) {
 						if idleSince.IsZero() {
 							idleSince = time.Now()
 						} else if time.Since(idleSince) >= 250*time.Millisecond {
-							// Progressive Sharpness Refinement: once motion stops, send one crisp frame.
+							// Progressive Sharpness Refinement: once motion stops, run hybrid
+							// lossless-PNG (text/UI) + high-Q JPEG (photo) pass across the screen.
 							needsRefine = false
 							idleSince = time.Time{}
 							refineQ := baseQ + 18
@@ -417,10 +419,28 @@ func (h *ScreenHost) serveConn(conn net.Conn) {
 								refineQ = 85
 							}
 							effQ = refineQ
-							needFull = true
+							for ty := 0; ty < hgt; ty += tileSize {
+								th := tileSize
+								if ty+th > hgt {
+									th = hgt - ty
+								}
+								for tx := 0; tx < w; tx += tileSize {
+									tw := tileSize
+									if tx+tw > w {
+										tw = w - tx
+									}
+									if isTextOrUITile(bgra, stride, tx, ty, tw, th) {
+										dirty = append(dirty, tileRect{x: tx, y: ty, w: tw, h: th})
+									}
+								}
+							}
+							dirty = mergeVertical(dirty)
+							if len(dirty) == 0 {
+								needFull = true
+							}
 						}
 					}
-					if !needFull {
+					if !needFull && len(dirty) == 0 {
 						goto sleepNext
 					}
 				} else {
@@ -485,9 +505,8 @@ func (h *ScreenHost) serveConn(conn net.Conn) {
 						return
 					}
 					writeDur = time.Since(ws)
-					if effQ < baseQ {
-						needsRefine = true
-					}
+					// Always schedule a lossless-PNG text refinement pass after a full JPEG frame.
+					needsRefine = true
 					if len(prevPix) != len(bgra) {
 						prevPix = make([]byte, len(bgra))
 					}
@@ -509,6 +528,7 @@ func (h *ScreenHost) serveConn(conn net.Conn) {
 						go func() {
 							defer wg.Done()
 							var localBuf bytes.Buffer
+							pngEnc := png.Encoder{CompressionLevel: png.BestSpeed}
 							for {
 								i := int(idx.Add(1) - 1)
 								if i >= len(dirty) {
@@ -517,7 +537,7 @@ func (h *ScreenHost) serveConn(conn net.Conn) {
 								r := dirty[i]
 								sub := cap.BGRAToRGBATile(bgra, stride, r.x, r.y, r.w, r.h)
 								localBuf.Reset()
-								if err := jpeg.Encode(&localBuf, sub, &jpeg.Options{Quality: effQ}); err == nil {
+								if encodeTileHybrid(&localBuf, &pngEnc, bgra, stride, r.x, r.y, r.w, r.h, sub, effQ) == nil {
 									cp := make([]byte, localBuf.Len())
 									copy(cp, localBuf.Bytes())
 									results[i] = encodedTile{r: r, data: cp}
@@ -527,10 +547,11 @@ func (h *ScreenHost) serveConn(conn net.Conn) {
 					}
 					wg.Wait()
 				} else {
+					pngEnc := png.Encoder{CompressionLevel: png.BestSpeed}
 					for i, r := range dirty {
 						sub := cap.BGRAToRGBATile(bgra, stride, r.x, r.y, r.w, r.h)
 						jpegBuf.Reset()
-						if err := jpeg.Encode(&jpegBuf, sub, &jpeg.Options{Quality: effQ}); err == nil {
+						if encodeTileHybrid(&jpegBuf, &pngEnc, bgra, stride, r.x, r.y, r.w, r.h, sub, effQ) == nil {
 							cp := make([]byte, jpegBuf.Len())
 							copy(cp, jpegBuf.Bytes())
 							results[i] = encodedTile{r: r, data: cp}
@@ -627,6 +648,57 @@ func (h *ScreenHost) serveInputOnly(conn net.Conn) {
 			}
 		}
 	}
+}
+
+// encodeTileHybrid selects lossless PNG (BestSpeed) for low-color text/UI regions
+// (giving mstsc-like razor-sharp text with zero 4:2:0 chroma blur) and JPEG for
+// photo/video regions.
+func encodeTileHybrid(buf *bytes.Buffer, pngEnc *png.Encoder, bgra []byte, stride, x, y, w, h int, img image.Image, jpegQuality int) error {
+	if isTextOrUITile(bgra, stride, x, y, w, h) {
+		if err := pngEnc.Encode(buf, img); err == nil {
+			// Guard against rare pathological PNG bloat on large blocks.
+			if buf.Len() <= w*h/2+1024 {
+				return nil
+			}
+			buf.Reset()
+		}
+	}
+	return jpeg.Encode(buf, img, &jpeg.Options{Quality: jpegQuality})
+}
+
+// isTextOrUITile samples pixels in the tile using a zero-alloc 4096-bit 12-bit RGB
+// color bitset. UI/text/code blocks typically have <= 24 distinct quantized colors.
+func isTextOrUITile(bgra []byte, stride, x, y, w, h int) bool {
+	var seen [64]uint64 // 64 * 64 = 4096 buckets for 4-4-4 quantized RGB
+	unique := 0
+	stepY := h / 16
+	if stepY < 1 {
+		stepY = 1
+	}
+	stepX := w / 16
+	if stepX < 1 {
+		stepX = 1
+	}
+	for row := y; row < y+h; row += stepY {
+		rowBase := row * stride
+		for col := x; col < x+w; col += stepX {
+			off := rowBase + col*4
+			if off+2 >= len(bgra) {
+				continue
+			}
+			key := (int(bgra[off+2]>>4) << 8) | (int(bgra[off+1]>>4) << 4) | int(bgra[off]>>4)
+			word := key >> 6
+			bit := uint64(1) << uint(key&63)
+			if seen[word]&bit == 0 {
+				seen[word] |= bit
+				unique++
+				if unique > 24 {
+					return false
+				}
+			}
+		}
+	}
+	return true
 }
 
 func tileChanged(cur, prev []byte, stride, x, y, w, h int) bool {

@@ -206,3 +206,36 @@ func TestScreenHostCloseWithActiveConn(t *testing.T) {
 	}
 }
 
+func TestHybridTileClassifier(t *testing.T) {
+	w, h := 64, 64
+	stride := w * 4
+
+	// Solid background + crisp text-like pixels => should classify as UI/Text (PNG).
+	ui := make([]byte, w*h*4)
+	for i := 0; i < len(ui); i += 4 {
+		ui[i], ui[i+1], ui[i+2], ui[i+3] = 30, 30, 30, 255
+	}
+	for x := 8; x < 56; x++ {
+		off := (20*w + x) * 4
+		ui[off], ui[off+1], ui[off+2] = 240, 240, 240
+	}
+	if !isTextOrUITile(ui, stride, 0, 0, w, h) {
+		t.Fatalf("expected UI/text tile to be classified as lossless PNG")
+	}
+
+	// Rich gradient/photo tile => should classify as photo (JPEG).
+	photo := make([]byte, w*h*4)
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			off := (y*w + x) * 4
+			photo[off] = byte((x * 4) & 0xFF)
+			photo[off+1] = byte((y * 4) & 0xFF)
+			photo[off+2] = byte(((x + y) * 3) & 0xFF)
+			photo[off+3] = 255
+		}
+	}
+	if isTextOrUITile(photo, stride, 0, 0, w, h) {
+		t.Fatalf("expected rich photo tile to be classified as JPEG")
+	}
+}
+
