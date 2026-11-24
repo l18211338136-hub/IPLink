@@ -650,21 +650,16 @@ func (ch *PeerChannel) Close() error {
 	return err
 }
 
-// RegisterIncoming stores a channel opened by a remote peer. A direct channel
-// always wins over a relay channel for the same peer.
+// RegisterIncoming stores a channel opened by a remote peer, replacing and
+// closing any previous channel for the same peer so reconnects work cleanly.
 func (c *Client) RegisterIncoming(peerID string, ch *PeerChannel) {
 	c.peerMu.Lock()
 	old := c.incoming[peerID]
-	if old == nil || (old.Mode == "relay" && ch.Mode == "p2p") {
-		c.incoming[peerID] = ch
-		c.peerMu.Unlock()
-		if old != nil {
-			_ = old.Close()
-		}
-		return
-	}
+	c.incoming[peerID] = ch
 	c.peerMu.Unlock()
-	_ = ch.Close()
+	if old != nil && old != ch {
+		_ = old.Close()
+	}
 }
 
 // PeerForwarder exposes a local TCP listener that tunnels connections over a
@@ -705,6 +700,8 @@ func (c *Client) ForwardPeerTCP(ctx context.Context, targetClientID, listenAddr,
 	var rtt time.Duration
 	if pingRTT, err := ch.Ping(ctx); err == nil {
 		rtt = pingRTT
+	} else {
+		c.log.Warn("peer channel ping failed", "peer", targetClientID, "mode", ch.Mode, "err", err)
 	}
 
 	ln, err := net.Listen("tcp", listenAddr)
@@ -876,12 +873,27 @@ func (c *Client) ConnectPeer(ctx context.Context, targetClientID string) (*PeerC
 		closePC()
 		return nil, fmt.Errorf("relay allocation denied: %s", ack.Error)
 	}
-	relayUDPAddr, err := net.ResolveUDPAddr("udp", ack.RelayAddr)
+	relayUDPAddr, err := c.resolveRelayUDPAddr(ack.RelayAddr)
 	if err != nil {
 		closePC()
 		return nil, err
 	}
 	return newPeerChannel("relay", targetClientID, pc, relayUDPAddr, ack.RelaySessionID, ack.RelayToken, c.dgramCipher), nil
+}
+
+// resolveRelayUDPAddr resolves the server-advertised relay address. When the server
+// listens on a wildcard address (e.g. 0.0.0.0:29001 or [::]:29001), its LocalAddr
+// contains an unspecified IP, so substitute the configured server address.
+func (c *Client) resolveRelayUDPAddr(raw string) (*net.UDPAddr, error) {
+	host, port, err := net.SplitHostPort(raw)
+	if err == nil {
+		if host == "" {
+			raw = net.JoinHostPort(c.cfg.Server.Address, port)
+		} else if ip := net.ParseIP(host); ip != nil && ip.IsUnspecified() {
+			raw = net.JoinHostPort(c.cfg.Server.Address, port)
+		}
+	}
+	return net.ResolveUDPAddr("udp", raw)
 }
 
 func (c *Client) authenticate(conn net.Conn) (uint64, error) {
@@ -1160,14 +1172,11 @@ func (c *Client) handleIncomingPeerConnect(ctx context.Context, info message.Pee
 }
 
 func (c *Client) handleIncomingRelay(notify message.RelayAllocNotify) {
-	if c.IncomingPeer(notify.FromClientID) != nil {
-		return
-	}
 	pc, err := c.listenPacket(context.Background())
 	if err != nil {
 		return
 	}
-	relayAddr, err := net.ResolveUDPAddr("udp", notify.RelayAddr)
+	relayAddr, err := c.resolveRelayUDPAddr(notify.RelayAddr)
 	if err != nil {
 		_ = pc.Close()
 		return
@@ -1178,7 +1187,7 @@ func (c *Client) handleIncomingRelay(notify message.RelayAllocNotify) {
 		go c.servePeerMux(notify.FromClientID, ch)
 	}
 	_ = ch.Send([]byte(peerRelayJoinPrefix + notify.RelaySessionID))
-	c.log.Info("joined relay session", "peer", notify.FromClientID, "relay", notify.RelaySessionID)
+	c.log.Info("joined relay session", "peer", notify.FromClientID, "relay", notify.RelaySessionID, "relay_addr", relayAddr.String())
 }
 
 func (c *Client) handleOpenConn(ctx context.Context, req message.TunnelOpenConn) {
