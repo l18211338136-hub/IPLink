@@ -38,7 +38,7 @@ const (
 	streamQueueSize     = 64
 	readChunkSize       = 32 * 1024
 	udpIdleTimeout      = 60 * time.Second
-	peerRecvQueueSize   = 64
+	peerRecvQueueSize   = 1024
 	peerPingInterval    = 300 * time.Millisecond
 	peerPingTimeout     = 3 * time.Second
 	peerPingPrefix      = "IPLINK_PING:"
@@ -85,6 +85,10 @@ type Client struct {
 	caps       message.ServerCapabilities
 	capsKnown  bool
 	publicAddr string
+
+	natMu      sync.Mutex
+	natProbeMu sync.Mutex
+	natPC      net.PacketConn
 
 	lastPong atomic.Int64 // UnixNano，最近一次收到 HeartbeatPong 的时间
 
@@ -191,23 +195,119 @@ func (c *Client) ConnectOnce(ctx context.Context) error {
 
 	c.log.Info("connected to IPLink server", "server", addr, "client_id", c.cfg.Client.ID, "session_id", sessID)
 
-	if natAddr := c.natEndpoint(); c.cfg.Network.EnableP2P && natAddr != "" {
-		if nonce, err := auth.GenerateNonce(); err == nil {
-			probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-			if pc, pcErr := c.listenPacket(probeCtx); pcErr == nil {
-				if pub, err := discovery.DiscoverPublicAddr(probeCtx, pc, natAddr, c.cfg.Client.ID, nonce, c.dgramCipher); err == nil {
-					c.mu.Lock()
-					c.publicAddr = pub
-					c.mu.Unlock()
-					c.log.Debug("discovered public UDP address", "public_addr", pub)
-				}
-				_ = pc.Close()
-			}
-			cancel()
+	return nil
+}
+
+// prepareNATSocket opens a persistent UDP socket, probes its public address via the
+// server's NAT endpoint, and publishes that address to the server so incoming P2P
+// hole-punching requests target this exact live socket.
+func (c *Client) prepareNATSocket(ctx context.Context) {
+	natAddr := c.natEndpoint()
+	if !c.cfg.Network.EnableP2P || natAddr == "" {
+		return
+	}
+	// Serialize NAT probes and takeNATSocket so ReadFrom/SetReadDeadline never race on natPC.
+	c.natProbeMu.Lock()
+	defer c.natProbeMu.Unlock()
+
+	nonce, err := auth.GenerateNonce()
+	if err != nil {
+		return
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+
+	c.natMu.Lock()
+	pc := c.natPC
+	c.natMu.Unlock()
+
+	created := false
+	if pc == nil {
+		var pcErr error
+		pc, pcErr = c.listenPacket(probeCtx)
+		if pcErr != nil {
+			return
 		}
+		created = true
 	}
 
-	return nil
+	pub, err := discovery.DiscoverPublicAddr(probeCtx, pc, natAddr, c.cfg.Client.ID, nonce, c.dgramCipher)
+	if err != nil {
+		if created {
+			_ = pc.Close()
+		}
+		return
+	}
+	_ = pc.SetReadDeadline(time.Time{})
+
+	c.natMu.Lock()
+	if created {
+		if c.natPC != nil {
+			_ = pc.Close()
+			c.natMu.Unlock()
+			return
+		}
+		c.natPC = pc
+	}
+	c.natMu.Unlock()
+
+	c.mu.Lock()
+	changed := c.publicAddr != pub
+	c.publicAddr = pub
+	c.mu.Unlock()
+
+	if changed {
+		c.log.Info("discovered public UDP address", "public_addr", pub)
+		// Publish publicAddr to the server (works even on existing servers without restart).
+		reqCtx, reqCancel := context.WithTimeout(ctx, 2*time.Second)
+		_, _ = c.sendRequest(reqCtx, protocol.MsgPeerConnectReq, message.PeerConnectReq{
+			TargetClientID: "",
+			MyPublicAddr:   pub,
+			MyLocalAddr:    pc.LocalAddr().String(),
+		})
+		reqCancel()
+	}
+}
+
+// takeNATSocket claims ownership of the persistent NAT-probed UDP socket for an
+// incoming P2P punch so the peer's punch packets hit the exact port we advertised.
+func (c *Client) takeNATSocket(ctx context.Context) (net.PacketConn, error) {
+	c.natProbeMu.Lock()
+	c.natMu.Lock()
+	pc := c.natPC
+	c.natPC = nil
+	c.natMu.Unlock()
+	c.natProbeMu.Unlock()
+	if pc != nil {
+		return pc, nil
+	}
+	return c.listenPacket(ctx)
+}
+
+// buildPunchCandidates expands peer public/local addresses with a LAN+publicPort
+// fallback so two peers on the same LAN succeed even when the router blocks NAT hairpinning.
+func buildPunchCandidates(peerPublicAddr, peerLocalAddr string) []string {
+	seen := make(map[string]struct{}, 3)
+	out := make([]string, 0, 3)
+	add := func(a string) {
+		a = strings.TrimSpace(a)
+		if a == "" {
+			return
+		}
+		if _, ok := seen[a]; ok {
+			return
+		}
+		seen[a] = struct{}{}
+		out = append(out, a)
+	}
+	add(peerPublicAddr)
+	if localHost, _, err := net.SplitHostPort(peerLocalAddr); err == nil && localHost != "" {
+		if _, pubPort, err := net.SplitHostPort(peerPublicAddr); err == nil && pubPort != "" {
+			add(net.JoinHostPort(localHost, pubPort))
+		}
+	}
+	add(peerLocalAddr)
+	return out
 }
 
 func (c *Client) listenPacket(ctx context.Context) (net.PacketConn, error) {
@@ -354,6 +454,8 @@ func (c *Client) Start(ctx context.Context) (<-chan error, error) {
 		defer wg.Done()
 		c.reapIdleUDP(serveCtx)
 	}()
+
+	go c.prepareNATSocket(serveCtx)
 
 	var registeredCount int
 	var lastTunnelErr error
@@ -514,6 +616,10 @@ type PeerChannel struct {
 }
 
 func newPeerChannel(mode, peerID string, conn net.PacketConn, peerAddr net.Addr, relayID, relayToken string, cipher *clientcrypto.DatagramCipher) *PeerChannel {
+	if uc, ok := conn.(*net.UDPConn); ok {
+		_ = uc.SetReadBuffer(2 * 1024 * 1024)
+		_ = uc.SetWriteBuffer(2 * 1024 * 1024)
+	}
 	ch := &PeerChannel{
 		Mode:       mode,
 		PeerID:     peerID,
@@ -831,7 +937,8 @@ func (c *Client) ConnectPeer(ctx context.Context, targetClientID string) (*PeerC
 		if err == nil && respFrame.Header.Type == protocol.MsgPeerConnectInfo {
 			var info message.PeerConnectInfo
 			if codec.DecodeJSON(respFrame, &info) == nil {
-				peerAddr, punchErr := punching.Punch(ctx, pc, info.PunchToken, []string{info.PeerPublicAddr, info.PeerLocalAddr}, c.dgramCipher)
+				candidates := buildPunchCandidates(info.PeerPublicAddr, info.PeerLocalAddr)
+				peerAddr, punchErr := punching.Punch(ctx, pc, info.PunchToken, candidates, c.dgramCipher)
 				if punchErr == nil {
 					c.metrics.P2PSuccesses.Add(1)
 					return newPeerChannel("p2p", targetClientID, pc, peerAddr, "", "", c.dgramCipher), nil
@@ -1153,11 +1260,15 @@ func (c *Client) handleIncomingPeerConnect(ctx context.Context, info message.Pee
 	if !c.cfg.Network.EnableP2P {
 		return
 	}
-	pc, err := c.listenPacket(ctx)
+	pc, err := c.takeNATSocket(ctx)
 	if err != nil {
 		return
 	}
-	peerAddr, err := punching.Punch(ctx, pc, info.PunchToken, []string{info.PeerPublicAddr, info.PeerLocalAddr}, c.dgramCipher)
+	// Prepare a fresh NAT-probed socket in the background for the next incoming peer.
+	defer func() { go c.prepareNATSocket(ctx) }()
+
+	candidates := buildPunchCandidates(info.PeerPublicAddr, info.PeerLocalAddr)
+	peerAddr, err := punching.Punch(ctx, pc, info.PunchToken, candidates, c.dgramCipher)
 	if err != nil {
 		_ = pc.Close()
 		c.log.Debug("incoming P2P punch failed", "peer", info.PeerID, "err", err)
@@ -1433,6 +1544,8 @@ func (c *Client) heartbeatLoop(ctx context.Context) {
 			if err == nil {
 				_ = c.sendFrame(f)
 			}
+			// Keep the persistent NAT UDP pinhole alive.
+			go c.prepareNATSocket(ctx)
 		}
 	}
 }
@@ -1500,4 +1613,11 @@ func (c *Client) cleanupSession() {
 		_ = ch.Close()
 	}
 	c.peerMu.Unlock()
+
+	c.natMu.Lock()
+	if c.natPC != nil {
+		_ = c.natPC.Close()
+		c.natPC = nil
+	}
+	c.natMu.Unlock()
 }

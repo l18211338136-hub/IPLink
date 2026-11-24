@@ -9,7 +9,9 @@
 - **纯 IP 通信**：不依赖 DNS 域名，直接使用 IP 地址与端口建立连接。
 - **Client / Server 分离架构**：服务端负责控制面协调、隧道监听与 Relay 中继；客户端负责内网服务映射与转发。
 - **TCP / UDP 内网穿透**：支持将内网 TCP 服务（HTTP、SSH、数据库等）和 UDP 服务映射到服务端端口。
-- **Direct First + Relay Fallback**：支持 UDP NAT 公网地址发现与 UDP Hole Punching，打洞失败时自动回退至 Server Relay 中继；两端都会建立可收发的通道，Relay 会话由服务端自动通知对端加入。
+- **Direct First + Relay Fallback**：支持持久 UDP NAT 公网地址发现、同局域网直连候选地址与 UDP Hole Punching，打洞失败时自动回退至 Server Relay 中继；两端都会建立可收发的通道，Relay 会话由服务端自动通知对端加入。
+- **P2P 可靠流多路复用（`internal/p2p`）**：在加密 UDP P2P/Relay 通道之上提供可靠有序流复用，内置 RFC 6298 自适应 SRTT/RTO、3 次重复 ACK 快速重传、有序重传与 2 MB UDP 内核收发缓冲。
+- **独立 P2P 远程桌面与文件传输客户端（`rdp/`）**：控制端与被控端共用单个 `iplink-rdp.exe`，支持系统 `mstsc` 转发、免 Windows 3389 内置同屏远控与断点续传 P2P 文件传输。
 - **安全认证与权限控制**：
   - Challenge-Response HMAC-SHA256 身份认证（不传输明文 Token，防重放）。
   - 全链路加密：控制面走 TLS 1.3；启用 TLS 后 HTTP 代理与指标端点也升级为 HTTPS。
@@ -36,11 +38,14 @@ IPLink/
 │   ├── protocol/               # 帧编解码、消息定义、JSON/二进制 Codec
 │   ├── transport/tcp/          # TCP / TLS 1.3 传输封装
 │   ├── nat/                    # UDP NAT 公网地址发现与打洞
+│   ├── p2p/                    # 基于 UDP 的可靠流多路复用（Mux / Stream）
 │   ├── relay/manager/          # UDP Relay 会话管理与转发
 │   ├── security/               # HMAC-SHA256 认证、TLS 1.3、目标白名单
 │   ├── config/                 # JSON 配置加载、环境变量展开与校验
 │   ├── logger/                 # 基于 slog 的结构化日志
 │   └── metrics/                # 运行时原子指标统计
+├── desktop/                    # 桌面端 GUI 客户端（Wails）
+├── rdp/                        # 独立 P2P 远程桌面与文件传输客户端（Wails）
 ├── pkg/protocol/               # 公共协议头与消息类型定义
 ├── configs/                    # 配置示例
 ├── docs/architecture/decisions/# 架构决策记录 (ADR)
@@ -155,9 +160,31 @@ scrape_configs:
   # 产物：bin/IPLink-Setup.exe（安装到 %LOCALAPPDATA%\Programs\IPLink，含开始菜单/桌面快捷方式与卸载项）
   ```
 
+## P2P 远程桌面与文件传输客户端（`rdp/`）
+
+`rdp/` 是独立的 Go module（Wails 桌面应用），控制端与被控端共用同一个 `bin/iplink-rdp.exe`，**无需修改服务端**即可通过 IPLink 的 P2P / Relay 通道进行远程控制与文件传输。
+
+- **每次启动唯一 Client ID**：自动基于本机非回环网卡 MAC 哈希 + 随机数生成 `rdp-<mac6>-<rand6>`，多台设备或多开实例互不冲突；配置保存在 `%APPDATA%\IPLink\rdp.json`。
+- **内置同屏远控（P2P 免 3389）**：
+  - 零第三方依赖，不依赖 Windows 远程桌面服务（3389），支持 Windows 家庭版与同屏协作；勾选「允许被同屏远控」即自动在 `127.0.0.1:29389` 就绪。
+  - **高性能抓屏与渲染**：64×64 精细分块 + 2D 脏矩形聚类合并、多核并行 JPEG 编码、原始 BGRA 零拷贝比对、自适应画质背压，以及静止 250ms 后自动补发高清帧（动时流畅、停时高清）。
+  - **双流分离与防卡死**：画面流（`msgRoleVideo`）与键鼠输入流（`msgRoleInput`）独立复用互不阻塞；画面流抖动时前端自动恢复并支持一键「刷新画面」；被控端自动追踪并在断连时释放所有按住的鼠标/键盘修饰键，防止卡键。
+  - **便捷操控**：支持一键将本机剪贴板文本粘贴到远端（完整支持中文/密码）、快捷发送 `Win` / `显示桌面` / `任务管理器` 等系统组合键。
+- **系统远程桌面模式（`mstsc`）**：仍支持通过 P2P / Relay 转发目标 `127.0.0.1:3389` 并自动拉起 Windows 自带 `mstsc.exe`。
+- **P2P 文件传输（支持断点续传）**：
+  - 使用独立文件流（`msgRoleFile`），按 `256 KB` 流式分块收发，不阻塞画面与键鼠操作。
+  - 基于文件内容指纹（文件名 + 大小 + 首尾 64 KB SHA-256）与 `.iplinkpart` 临时断点文件，支持网络闪断自动重试续传及跨重启手动续传，传输完成后自动重命名保存到 `下载\IPLink\` 目录（界面支持一键打开接收目录）。
+- **编译（Windows 64 位）**：
+  ```powershell
+  cd rdp
+  $env:GOOS="windows"; $env:GOARCH="amd64"
+  go build -tags desktop,production -ldflags="-H windowsgui -s -w" -o ..\bin\iplink-rdp.exe .
+  ```
+
 ## 测试
 
 ```bash
 go vet ./...
 go test -v ./...
+cd rdp && go vet ./... && go test -v ./...
 ```

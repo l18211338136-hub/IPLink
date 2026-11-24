@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -14,12 +15,14 @@ import (
 
 const (
 	headerSize    = 15
-	maxChunkSize  = 1150
-	maxInFlight   = 64
-	maxRecvWindow = 128
-	initialRTO    = 150 * time.Millisecond
+	maxChunkSize  = 1300
+	maxInFlight   = 256
+	maxRecvWindow = 512
+	minRTO        = 80 * time.Millisecond
+	initialRTO    = 120 * time.Millisecond
 	maxRTO        = 1500 * time.Millisecond
-	tickInterval  = 25 * time.Millisecond
+	tickInterval  = 15 * time.Millisecond
+	ackEveryPkts  = 8
 )
 
 const (
@@ -321,6 +324,11 @@ type Stream struct {
 	nextSendSeq  uint32
 	sendUnacked  map[uint32]*sentPacket
 	peerWindow   uint16
+	lastAck      uint32
+	dupAckCount  int
+	srtt         time.Duration
+	rttvar       time.Duration
+	rto          time.Duration
 	finSent      bool
 	closedLocal  bool
 	closedRemote bool
@@ -331,6 +339,7 @@ type Stream struct {
 	finSeq      uint32
 	readBuf     []byte
 	ackDirty    bool
+	ackPending  int
 
 	readDeadline  time.Time
 	writeDeadline time.Time
@@ -345,6 +354,7 @@ func newStream(m *Mux, id uint32) *Stream {
 		nextSendSeq:  1,
 		sendUnacked:  make(map[uint32]*sentPacket),
 		peerWindow:   maxInFlight,
+		rto:          initialRTO,
 		nextRecvSeq:  1,
 		oooBuf:       make(map[uint32][]byte),
 		notifyCh:     make(chan struct{}, 1),
@@ -375,21 +385,32 @@ func (s *Stream) onPacket(h packetHeader, payload []byte) {
 		s.abort(io.ErrUnexpectedEOF)
 	case msgAck:
 		s.mu.Lock()
-		s.handleAckLocked(h.Ack, h.Window)
+		retransmit := s.handleAckLocked(h.Ack, h.Window)
 		s.mu.Unlock()
+		if retransmit != nil {
+			_ = s.mux.transport.Send(retransmit)
+		}
 		s.signal()
 	case msgData:
 		s.mu.Lock()
+		var retransmit []byte
 		if h.Ack > 0 {
-			s.handleAckLocked(h.Ack, h.Window)
+			retransmit = s.handleAckLocked(h.Ack, h.Window)
 		}
-		s.handleDataLocked(h.Seq, payload)
+		immAck := s.handleDataLocked(h.Seq, payload)
 		s.mu.Unlock()
+		if retransmit != nil {
+			_ = s.mux.transport.Send(retransmit)
+		}
+		if immAck != nil {
+			_ = s.mux.transport.Send(immAck)
+		}
 		s.signal()
 	case msgFin:
 		s.mu.Lock()
+		var retransmit []byte
 		if h.Ack > 0 {
-			s.handleAckLocked(h.Ack, h.Window)
+			retransmit = s.handleAckLocked(h.Ack, h.Window)
 		}
 		if s.finSeq == 0 || h.Seq < s.finSeq {
 			s.finSeq = h.Seq
@@ -399,28 +420,83 @@ func (s *Stream) onPacket(h packetHeader, payload []byte) {
 		}
 		s.ackDirty = true
 		s.mu.Unlock()
+		if retransmit != nil {
+			_ = s.mux.transport.Send(retransmit)
+		}
 		s.signal()
 	}
 }
 
-func (s *Stream) handleAckLocked(ack uint32, window uint16) {
+func (s *Stream) handleAckLocked(ack uint32, window uint16) []byte {
 	if window > 0 {
 		s.peerWindow = window
 	}
-	for seq := range s.sendUnacked {
+	now := time.Now()
+	progressed := false
+	for seq, sp := range s.sendUnacked {
 		if seq < ack {
+			// RFC 6298 SRTT / RTTVAR update using only non-retransmitted packets (Karn's algorithm).
+			if sp.attempts == 0 {
+				sample := now.Sub(sp.sentAt)
+				if sample > 0 && sample < 2*time.Second {
+					if s.srtt == 0 {
+						s.srtt = sample
+						s.rttvar = sample / 2
+					} else {
+						diff := s.srtt - sample
+						if diff < 0 {
+							diff = -diff
+						}
+						s.rttvar = (3*s.rttvar + diff) / 4
+						s.srtt = (7*s.srtt + sample) / 8
+					}
+					rto := s.srtt + 4*s.rttvar
+					if rto < minRTO {
+						rto = minRTO
+					} else if rto > maxRTO {
+						rto = maxRTO
+					}
+					s.rto = rto
+				}
+			}
 			delete(s.sendUnacked, seq)
+			progressed = true
 		}
 	}
+	if ack > s.lastAck || progressed {
+		s.lastAck = ack
+		s.dupAckCount = 0
+		return nil
+	}
+	// Fast Retransmit on 3 duplicate ACKs for the same missing sequence number.
+	if ack > 0 && ack == s.lastAck {
+		s.dupAckCount++
+		if s.dupAckCount == 3 {
+			if sp, ok := s.sendUnacked[ack]; ok {
+				if now.Sub(sp.sentAt) >= 10*time.Millisecond {
+					sp.sentAt = now
+					sp.attempts++
+					return encodePacket(packetHeader{
+						Type:     sp.pktType,
+						StreamID: s.id,
+						Seq:      sp.seq,
+						Ack:      s.nextRecvSeq,
+						Window:   maxRecvWindow,
+					}, sp.payload)
+				}
+			}
+		}
+	}
+	return nil
 }
 
-func (s *Stream) handleDataLocked(seq uint32, payload []byte) {
+func (s *Stream) handleDataLocked(seq uint32, payload []byte) []byte {
 	if seq < s.nextRecvSeq {
 		s.ackDirty = true
-		return
+		return nil
 	}
 	if seq >= s.nextRecvSeq+maxRecvWindow {
-		return
+		return nil
 	}
 	if seq == s.nextRecvSeq {
 		s.readBuf = append(s.readBuf, payload...)
@@ -438,49 +514,68 @@ func (s *Stream) handleDataLocked(seq uint32, payload []byte) {
 			s.closedRemote = true
 		}
 		s.ackDirty = true
-		return
+		s.ackPending++
+		if s.ackPending >= ackEveryPkts {
+			s.ackPending = 0
+			s.ackDirty = false
+			return encodePacket(packetHeader{
+				Type:     msgAck,
+				StreamID: s.id,
+				Ack:      s.nextRecvSeq,
+				Window:   maxRecvWindow,
+			}, nil)
+		}
+		return nil
 	}
 	if _, exists := s.oooBuf[seq]; !exists {
 		cp := make([]byte, len(payload))
 		copy(cp, payload)
 		s.oooBuf[seq] = cp
 	}
-	// Send immediate duplicate ACK to help trigger retransmit.
-	_ = s.mux.transport.Send(encodePacket(packetHeader{
+	// Send immediate duplicate ACK to trigger fast retransmit.
+	return encodePacket(packetHeader{
 		Type:     msgAck,
 		StreamID: s.id,
 		Ack:      s.nextRecvSeq,
 		Window:   maxRecvWindow,
-	}, nil))
+	}, nil)
 }
 
 func (s *Stream) onTick(now time.Time) {
 	s.mu.Lock()
-	var toSend [][]byte
+	var expired []*sentPacket
 	for _, sp := range s.sendUnacked {
 		if now.Sub(sp.sentAt) >= sp.rto {
-			if sp.attempts >= 16 {
+			if sp.attempts >= 30 {
 				s.mu.Unlock()
 				s.abort(errors.New("p2p stream retransmit timeout"))
 				return
 			}
-			sp.attempts++
-			sp.sentAt = now
-			sp.rto *= 2
-			if sp.rto > maxRTO {
-				sp.rto = maxRTO
-			}
-			toSend = append(toSend, encodePacket(packetHeader{
-				Type:     sp.pktType,
-				StreamID: s.id,
-				Seq:      sp.seq,
-				Ack:      s.nextRecvSeq,
-				Window:   maxRecvWindow,
-			}, sp.payload))
+			expired = append(expired, sp)
 		}
+	}
+	if len(expired) > 1 {
+		sort.Slice(expired, func(i, j int) bool { return expired[i].seq < expired[j].seq })
+	}
+	var toSend [][]byte
+	for _, sp := range expired {
+		sp.attempts++
+		sp.sentAt = now
+		sp.rto *= 2
+		if sp.rto > maxRTO {
+			sp.rto = maxRTO
+		}
+		toSend = append(toSend, encodePacket(packetHeader{
+			Type:     sp.pktType,
+			StreamID: s.id,
+			Seq:      sp.seq,
+			Ack:      s.nextRecvSeq,
+			Window:   maxRecvWindow,
+		}, sp.payload))
 	}
 	if s.ackDirty && len(toSend) == 0 {
 		s.ackDirty = false
+		s.ackPending = 0
 		toSend = append(toSend, encodePacket(packetHeader{
 			Type:     msgAck,
 			StreamID: s.id,
@@ -515,6 +610,13 @@ func (s *Stream) Read(p []byte) (int, error) {
 		if len(s.readBuf) > 0 {
 			n := copy(p, s.readBuf)
 			s.readBuf = s.readBuf[n:]
+			if len(s.readBuf) == 0 {
+				if cap(s.readBuf) > 256*1024 {
+					s.readBuf = nil
+				} else {
+					s.readBuf = s.readBuf[:0]
+				}
+			}
 			s.mu.Unlock()
 			return n, nil
 		}
@@ -570,7 +672,7 @@ func (s *Stream) Write(p []byte) (int, error) {
 					pktType: msgData,
 					payload: cp,
 					sentAt:  time.Now(),
-					rto:     initialRTO,
+					rto:     s.rto,
 				}
 				ack := s.nextRecvSeq
 				s.ackDirty = false
@@ -691,4 +793,3 @@ func (s *Stream) SetWriteDeadline(t time.Time) error {
 	s.signal()
 	return nil
 }
-

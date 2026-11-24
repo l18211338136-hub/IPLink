@@ -14,8 +14,9 @@
       line-height: 1.5;
     }
     .container { max-width: 900px; margin: 0 auto; display: flex; flex-direction: column; gap: 16px; }
-    .header { display: flex; justify-content: space-between; align-items: center; }
+    .header { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
     .header h1 { font-size: 20px; font-weight: 600; color: #f8fafc; }
+    .badges { display: flex; gap: 8px; align-items: center; }
     .badge {
       padding: 4px 10px; border-radius: 999px; font-size: 12px; font-weight: 600;
       background: #334155; color: #cbd5e1;
@@ -28,7 +29,7 @@
     .card h2 { font-size: 14px; color: #94a3b8; margin-bottom: 12px; text-transform: uppercase; letter-spacing: 0.05em; }
     .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; }
     label { display: block; font-size: 12px; color: #94a3b8; margin-bottom: 4px; }
-    input[type="text"], input[type="number"], input[type="password"] {
+    input[type="text"], input[type="number"], input[type="password"], select {
       width: 100%; padding: 8px 10px; border-radius: 6px; border: 1px solid #475569;
       background: #0f172a; color: #f8fafc; font-size: 13px;
     }
@@ -41,6 +42,7 @@
     button:disabled { opacity: 0.45; cursor: not-allowed; }
     .btn-primary { background: #3b82f6; color: #fff; }
     .btn-success { background: #10b981; color: #fff; }
+    .btn-purple { background: #8b5cf6; color: #fff; }
     .btn-danger { background: #ef4444; color: #fff; }
     .btn-ghost { background: #334155; color: #e2e8f0; }
     .peers-list { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
@@ -51,20 +53,56 @@
     .peer-chip:hover { border-color: #3b82f6; }
     .status-box {
       background: #0f172a; border: 1px solid #334155; border-radius: 8px; padding: 12px;
-      font-size: 13px; display: flex; justify-content: space-between; align-items: center;
+      font-size: 13px; display: flex; justify-content: space-between; align-items: center; gap: 10px;
     }
     .logs {
       background: #020617; border: 1px solid #334155; border-radius: 8px; padding: 10px;
-      height: 180px; overflow-y: auto; font-family: Consolas, monospace; font-size: 12px; color: #94a3b8;
+      height: 170px; overflow-y: auto; font-family: Consolas, monospace; font-size: 12px; color: #94a3b8;
     }
-    .check { display: flex; align-items: center; gap: 6px; font-size: 13px; color: #cbd5e1; margin-top: 20px; }
+    .check { display: flex; align-items: center; gap: 6px; font-size: 13px; color: #cbd5e1; margin-top: 20px; flex-wrap: wrap; }
+    .host-bar {
+      display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px;
+      margin-top: 12px; padding-top: 12px; border-top: 1px solid #334155; font-size: 13px; color: #cbd5e1;
+    }
+    .host-bar label { display: inline-flex; align-items: center; gap: 6px; margin: 0; font-size: 13px; color: #e2e8f0; cursor: pointer; }
+
+    /* Built-in P2P Screen Viewer Overlay */
+    .viewer-overlay {
+      position: fixed; inset: 0; background: #020617; z-index: 9999;
+      display: none; flex-direction: column;
+    }
+    .viewer-overlay.active { display: flex; }
+    .viewer-toolbar {
+      display: flex; align-items: center; justify-content: space-between; gap: 10px;
+      padding: 8px 14px; background: #1e293b; border-bottom: 1px solid #334155;
+      font-size: 12px; flex-shrink: 0; flex-wrap: wrap;
+    }
+    .viewer-toolbar .left, .viewer-toolbar .right {
+      display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+    }
+    .viewer-toolbar select { width: auto; padding: 4px 8px; font-size: 12px; }
+    .viewer-toolbar button { padding: 5px 10px; font-size: 12px; }
+    .viewer-stage {
+      flex: 1; display: flex; align-items: center; justify-content: center;
+      overflow: hidden; position: relative; background: #000;
+    }
+    #remoteCanvas {
+      max-width: 100%; max-height: 100%; object-fit: contain;
+      outline: none; cursor: default; user-select: none;
+    }
+    .viewer-msg {
+      position: absolute; color: #94a3b8; font-size: 14px; pointer-events: none;
+    }
   </style>
 </head>
 <body>
   <div class="container">
     <div class="header">
       <h1>IP Link P2P 远程桌面</h1>
-      <span id="serverBadge" class="badge">未连接服务端</span>
+      <div class="badges">
+        <span id="hostBadge" class="badge">受控服务未开启</span>
+        <span id="serverBadge" class="badge">未连接服务端</span>
+      </div>
     </div>
 
     <div class="card">
@@ -98,6 +136,13 @@
         <button id="btnDisconnectServer" class="btn-danger" onclick="disconnectServer()" disabled>断开服务端</button>
         <button id="btnRefreshPeers" class="btn-ghost" onclick="refreshPeers()" disabled>刷新在线设备</button>
       </div>
+      <div class="host-bar">
+        <label>
+          <input id="allowRemoteControl" type="checkbox" checked onchange="toggleRemoteHost()" />
+          <span>允许其他设备通过「内置 P2P 同屏 / 传文件」连接本机（无需 Windows 3389）</span>
+        </label>
+        <button class="btn-ghost" style="padding:5px 10px;font-size:12px;" onclick="openReceiveFolder()">打开接收目录</button>
+      </div>
       <div id="peersList" class="peers-list"></div>
     </div>
 
@@ -109,17 +154,29 @@
           <input id="targetClientID" type="text" placeholder="点击上方在线设备或手动输入" />
         </div>
         <div>
-          <label>被控端桌面端口</label>
+          <label>系统 RDP 端口（仅 mstsc 模式）</label>
           <input id="remoteAddr" type="text" value="127.0.0.1:3389" />
         </div>
       </div>
       <div class="row">
-        <button id="btnConnectRDP" class="btn-success" onclick="connectRDP()" disabled>P2P 连接远程桌面 (mstsc)</button>
+        <button id="btnConnectBuiltin" class="btn-purple" onclick="connectBuiltinScreen()" disabled>内置同屏远控 (P2P 免 3389)</button>
+        <button id="btnSendFile" class="btn-primary" onclick="sendFile()" disabled>发送文件 (P2P)</button>
+        <button id="btnConnectRDP" class="btn-success" onclick="connectRDP()" disabled>系统远程桌面 (mstsc)</button>
+        <button id="btnOpenViewer" class="btn-ghost" onclick="showViewer()" style="display:none;">打开画面窗口</button>
         <button id="btnDisconnectRDP" class="btn-danger" onclick="disconnectRDP()" disabled>断开远程桌面通道</button>
       </div>
       <div id="tunnelBox" class="status-box" style="margin-top:12px; display:none;">
         <span id="tunnelInfo"></span>
         <span id="tunnelBadge" class="badge connected"></span>
+      </div>
+      <div id="transferBox" class="status-box" style="margin-top:8px; display:none; flex-direction:column; align-items:stretch; gap:6px;">
+        <div style="display:flex; justify-content:space-between; align-items:center;">
+          <span id="transferText" style="font-size:12px; color:#cbd5e1;"></span>
+          <span id="transferPct" class="badge connecting">0%</span>
+        </div>
+        <div style="height:6px; background:#1e293b; border-radius:4px; overflow:hidden;">
+          <div id="transferBar" style="height:100%; width:0%; background:#3b82f6; transition:width 0.15s;"></div>
+        </div>
       </div>
     </div>
 
@@ -129,33 +186,111 @@
     </div>
   </div>
 
+  <!-- Built-in P2P Screen Viewer Overlay -->
+  <div id="viewerOverlay" class="viewer-overlay">
+    <div class="viewer-toolbar">
+      <div class="left">
+        <strong id="viewerTitle">远程同屏</strong>
+        <span id="viewerModeBadge" class="badge connected">P2P</span>
+        <span id="viewerStats" style="color:#94a3b8;">连接中...</span>
+      </div>
+      <div class="right">
+        <select id="qualityPreset" onchange="applyQualityPreset()">
+          <option value="fast">流畅 (50% / 20fps)</option>
+          <option value="balanced" selected>均衡 (75% / 18fps)</option>
+          <option value="hd">高清 (100% / 15fps)</option>
+        </select>
+        <button class="btn-primary" onclick="sendFile()">传文件</button>
+        <button class="btn-ghost" onclick="refreshScreen()">刷新画面</button>
+        <button class="btn-ghost" onclick="pasteLocalClipboard()">粘贴剪贴板</button>
+        <button class="btn-ghost" onclick="sendWinKey()">Win</button>
+        <button class="btn-ghost" onclick="sendShowDesktop()">显示桌面</button>
+        <button class="btn-ghost" onclick="sendTaskMgr()">任务管理器</button>
+        <button class="btn-ghost" onclick="toggleFullscreen()">全屏</button>
+        <button class="btn-ghost" onclick="hideViewer()">最小化画面</button>
+        <button class="btn-danger" onclick="disconnectRDP()">断开</button>
+      </div>
+    </div>
+    <div id="viewerTransferBar" style="display:none; padding:4px 14px; background:#0f172a; border-bottom:1px solid #334155; font-size:12px; color:#93c5fd;"></div>
+    <div class="viewer-stage">
+      <div id="viewerMsg" class="viewer-msg">正在建立 P2P 画面流...</div>
+      <canvas id="remoteCanvas" tabindex="0"></canvas>
+    </div>
+  </div>
+
   <script>
     const go = () => window.go.main.App;
+
+    let viewerWS = null;
+    let currentWSURL = '';
+    let wsReconnectTimer = null;
+    let decoding = false;
+    let frameCount = 0;
+    let byteCount = 0;
+    let fpsTimer = null;
+    let lastMoveSent = 0;
+    let currentRTT = 0;
+    let remoteWidth = 0;
+    let remoteHeight = 0;
 
     async function init() {
       const cfg = await go().GetConfig();
       document.getElementById('serverAddress').value = cfg.server_address || '';
-      document.getElementById('serverPort').value = cfg.server_port || 7000;
+      document.getElementById('serverPort').value = cfg.server_port || 29000;
       document.getElementById('token').value = cfg.token || '';
       document.getElementById('clientID').value = cfg.client_id || '';
       document.getElementById('tlsEnabled').checked = !!cfg.tls_enabled;
       document.getElementById('tlsInsecure').checked = !!cfg.tls_insecure;
       document.getElementById('targetClientID').value = cfg.target_client_id || '';
       document.getElementById('remoteAddr').value = cfg.remote_addr || '127.0.0.1:3389';
+      document.getElementById('allowRemoteControl').checked = cfg.allow_remote_control !== false;
+
+      setupCanvasEvents();
+      await pollState();
       setInterval(pollState, 1000);
+    }
+
+    async function toggleRemoteHost() {
+      const enabled = document.getElementById('allowRemoteControl').checked;
+      try {
+        await go().SetRemoteControlHost(enabled);
+        await pollState();
+      } catch (e) {
+        alert(e);
+      }
+    }
+
+    async function openReceiveFolder() {
+      try {
+        await go().OpenReceiveFolder();
+      } catch (e) {
+        alert(e);
+      }
+    }
+
+    async function sendFile() {
+      const target = document.getElementById('targetClientID').value.trim();
+      try {
+        await go().PickAndSendFile(target);
+        await pollState();
+      } catch (e) {
+        alert(e);
+      }
     }
 
     async function connectServer() {
       try {
+        const allow = document.getElementById('allowRemoteControl').checked;
         await go().ConnectServer({
           server_address: document.getElementById('serverAddress').value.trim(),
-          server_port: parseInt(document.getElementById('serverPort').value, 10) || 7000,
+          server_port: parseInt(document.getElementById('serverPort').value, 10) || 29000,
           token: document.getElementById('token').value,
           client_id: document.getElementById('clientID').value.trim(),
           tls_enabled: document.getElementById('tlsEnabled').checked,
           tls_insecure: document.getElementById('tlsInsecure').checked,
           target_client_id: document.getElementById('targetClientID').value.trim(),
           remote_addr: document.getElementById('remoteAddr').value.trim(),
+          allow_remote_control: allow,
         });
       } catch (e) {
         alert(e);
@@ -163,6 +298,8 @@
     }
 
     async function disconnectServer() {
+      closeViewerWS();
+      hideViewer();
       await go().DisconnectServer();
       document.getElementById('peersList').innerHTML = '';
     }
@@ -173,7 +310,7 @@
         const box = document.getElementById('peersList');
         box.innerHTML = '';
         if (!peers || peers.length === 0) {
-          box.innerHTML = '<span style="font-size:12px;color:#64748b;">暂无其他在线设备</span>';
+          box.innerHTML = '<span style="font-size:12px;color:#64748b;">当前没有其他在线设备</span>';
           return;
         }
         peers.forEach(p => {
@@ -189,44 +326,425 @@
     }
 
     async function connectRDP() {
+      const target = document.getElementById('targetClientID').value.trim();
+      const addr = document.getElementById('remoteAddr').value.trim();
+      const btn = document.getElementById('btnConnectRDP');
+      btn.disabled = true;
+      btn.textContent = '正在打洞连接...';
       try {
-        const target = document.getElementById('targetClientID').value.trim();
-        const remote = document.getElementById('remoteAddr').value.trim();
-        await go().ConnectRemoteDesktop(target, remote);
+        await go().ConnectRemoteDesktop(target, addr);
         await pollState();
       } catch (e) {
         alert(e);
+      } finally {
+        btn.textContent = '系统远程桌面 (mstsc)';
+        await pollState();
+      }
+    }
+
+    async function connectBuiltinScreen() {
+      const target = document.getElementById('targetClientID').value.trim();
+      const btn = document.getElementById('btnConnectBuiltin');
+      btn.disabled = true;
+      btn.textContent = '正在建立 P2P 同屏...';
+      try {
+        const st = await go().ConnectBuiltinScreen(target);
+        await pollState();
+        if (st && st.viewer_ws_url) {
+          openViewer(st);
+        }
+      } catch (e) {
+        alert(e);
+      } finally {
+        btn.textContent = '内置同屏远控 (P2P 免 3389)';
+        await pollState();
       }
     }
 
     async function disconnectRDP() {
+      closeViewerWS();
+      hideViewer();
       await go().DisconnectRemoteDesktop();
       await pollState();
+    }
+
+    function showViewer() {
+      document.getElementById('viewerOverlay').classList.add('active');
+      document.getElementById('remoteCanvas').focus();
+    }
+
+    function hideViewer() {
+      if (document.fullscreenElement) {
+        document.exitFullscreen().catch(() => {});
+      }
+      document.getElementById('viewerOverlay').classList.remove('active');
+    }
+
+    function toggleFullscreen() {
+      const el = document.getElementById('viewerOverlay');
+      if (!document.fullscreenElement) {
+        el.requestFullscreen().catch(() => {});
+      } else {
+        document.exitFullscreen().catch(() => {});
+      }
+    }
+
+    function openViewer(st) {
+      document.getElementById('viewerTitle').textContent = '远程同屏: ' + (st.target_client_id || '');
+      document.getElementById('viewerModeBadge').textContent = (st.tunnel_mode || 'p2p').toUpperCase();
+      currentRTT = st.rtt_ms || 0;
+      document.getElementById('viewerMsg').style.display = 'block';
+      document.getElementById('viewerMsg').textContent = '正在接收远端桌面画面...';
+      showViewer();
+      connectViewerWS(st.viewer_ws_url);
+    }
+
+    function closeViewerWS() {
+      if (wsReconnectTimer) {
+        clearTimeout(wsReconnectTimer);
+        wsReconnectTimer = null;
+      }
+      if (fpsTimer) {
+        clearInterval(fpsTimer);
+        fpsTimer = null;
+      }
+      if (viewerWS) {
+        const old = viewerWS;
+        viewerWS = null;
+        try { old.close(); } catch (_) {}
+      }
+      currentWSURL = '';
+    }
+
+    function connectViewerWS(url) {
+      closeViewerWS();
+      currentWSURL = url;
+      const ws = new WebSocket(url);
+      ws.binaryType = 'arraybuffer';
+      viewerWS = ws;
+
+      const canvas = document.getElementById('remoteCanvas');
+      const ctx = canvas.getContext('2d');
+      const msgEl = document.getElementById('viewerMsg');
+
+      frameCount = 0;
+      byteCount = 0;
+      fpsTimer = setInterval(() => {
+        const res = remoteWidth && remoteHeight ? `${remoteWidth}x${remoteHeight}` : '-';
+        const kbps = Math.round(byteCount / 1024);
+        document.getElementById('viewerStats').textContent = `分辨率 ${res} | ${frameCount} FPS | ${kbps} KB/s | RTT ${currentRTT}ms`;
+        frameCount = 0;
+        byteCount = 0;
+      }, 1000);
+
+      ws.onopen = () => {
+        applyQualityPreset();
+        canvas.focus();
+      };
+
+      let renderChain = Promise.resolve();
+
+      ws.onmessage = (ev) => {
+        if (typeof ev.data === 'string') {
+          try {
+            const info = JSON.parse(ev.data);
+            if (info.error) {
+              msgEl.style.display = 'block';
+              msgEl.textContent = info.error;
+              return;
+            }
+            if (info.width && info.height) {
+              remoteWidth = info.width;
+              remoteHeight = info.height;
+            }
+          } catch (_) {}
+          return;
+        }
+        const buf = ev.data;
+        if (!buf || buf.byteLength <= 5) return;
+        byteCount += buf.byteLength;
+        const view = new DataView(buf);
+        const msgType = view.getUint8(0);
+
+        if (msgType === 0x02) {
+          // Full frame: [0x02][w:2B][h:2B][jpeg]
+          const w = view.getUint16(1, false);
+          const h = view.getUint16(3, false);
+          const jpegBlob = new Blob([buf.slice(5)], { type: 'image/jpeg' });
+          const decodePromise = createImageBitmap(jpegBlob);
+          renderChain = renderChain.then(() => decodePromise).then(bmp => {
+            if (canvas.width !== w || canvas.height !== h) {
+              canvas.width = w;
+              canvas.height = h;
+            }
+            ctx.drawImage(bmp, 0, 0, w, h);
+            bmp.close();
+            msgEl.style.display = 'none';
+            frameCount++;
+          }).catch(() => {});
+        } else if (msgType === 0x03) {
+          // Dirty tiles: [0x03][sw:2B][sh:2B][count:2B] + count * ([x:2B][y:2B][w:2B][h:2B][len:4B][jpeg])
+          const sw = view.getUint16(1, false);
+          const sh = view.getUint16(3, false);
+          const count = view.getUint16(5, false);
+          let off = 7;
+          const jobs = [];
+          for (let i = 0; i < count && off + 12 <= buf.byteLength; i++) {
+            const x = view.getUint16(off, false);
+            const y = view.getUint16(off + 2, false);
+            const w = view.getUint16(off + 4, false);
+            const h = view.getUint16(off + 6, false);
+            const len = view.getUint32(off + 8, false);
+            off += 12;
+            if (off + len > buf.byteLength) break;
+            const blob = new Blob([buf.slice(off, off + len)], { type: 'image/jpeg' });
+            off += len;
+            jobs.push(createImageBitmap(blob).then(bmp => ({ bmp, x, y, w, h })));
+          }
+          const batchPromise = Promise.all(jobs);
+          renderChain = renderChain.then(() => batchPromise).then(tiles => {
+            if (canvas.width !== sw || canvas.height !== sh) {
+              canvas.width = sw;
+              canvas.height = sh;
+            }
+            for (const t of tiles) {
+              ctx.drawImage(t.bmp, t.x, t.y, t.w, t.h);
+              t.bmp.close();
+            }
+            msgEl.style.display = 'none';
+            frameCount++;
+          }).catch(() => {});
+        }
+      };
+
+      ws.onclose = () => {
+        if (viewerWS === ws) {
+          viewerWS = null;
+          if (currentWSURL) {
+            msgEl.style.display = 'block';
+            msgEl.textContent = '画面流波动，正在自动恢复...';
+            const targetURL = currentWSURL;
+            wsReconnectTimer = setTimeout(() => {
+              if (currentWSURL === targetURL) {
+                connectViewerWS(targetURL);
+              }
+            }, 1000);
+          } else {
+            msgEl.style.display = 'block';
+            msgEl.textContent = '远端画面流已断开';
+          }
+        }
+      };
+    }
+
+    function refreshScreen() {
+      sendInput({ t: 'refresh' });
+      document.getElementById('remoteCanvas').focus();
+    }
+
+    function sendInput(obj) {
+      if (viewerWS && viewerWS.readyState === WebSocket.OPEN) {
+        viewerWS.send(JSON.stringify(obj));
+      }
+    }
+
+    function applyQualityPreset() {
+      const val = document.getElementById('qualityPreset').value;
+      if (val === 'fast') {
+        sendInput({ t: 'config', scale: 0.5, quality: 45, fps: 20 });
+      } else if (val === 'hd') {
+        sendInput({ t: 'config', scale: 1.0, quality: 72, fps: 15 });
+      } else {
+        sendInput({ t: 'config', scale: 0.75, quality: 55, fps: 18 });
+      }
+    }
+
+    function sendWinKey() {
+      sendInput({ t: 'keydown', vk: 0x5B });
+      setTimeout(() => sendInput({ t: 'keyup', vk: 0x5B }), 50);
+      document.getElementById('remoteCanvas').focus();
+    }
+
+    function sendShowDesktop() {
+      sendInput({ t: 'keydown', vk: 0x5B });
+      sendInput({ t: 'keydown', vk: 0x44 }); // D
+      setTimeout(() => {
+        sendInput({ t: 'keyup', vk: 0x44 });
+        sendInput({ t: 'keyup', vk: 0x5B });
+      }, 50);
+      document.getElementById('remoteCanvas').focus();
+    }
+
+    function sendTaskMgr() {
+      sendInput({ t: 'keydown', vk: 0x11 }); // Ctrl
+      sendInput({ t: 'keydown', vk: 0x10 }); // Shift
+      sendInput({ t: 'keydown', vk: 0x1B }); // Esc
+      setTimeout(() => {
+        sendInput({ t: 'keyup', vk: 0x1B });
+        sendInput({ t: 'keyup', vk: 0x10 });
+        sendInput({ t: 'keyup', vk: 0x11 });
+      }, 50);
+      document.getElementById('remoteCanvas').focus();
+    }
+
+    async function pasteLocalClipboard() {
+      try {
+        const text = await navigator.clipboard.readText();
+        if (!text) {
+          alert('本机剪贴板为空（或非文本内容）');
+          return;
+        }
+        sendInput({ t: 'paste', text });
+        document.getElementById('remoteCanvas').focus();
+      } catch (e) {
+        const manual = prompt('请输入或粘贴要发送到远端的文本：');
+        if (manual) {
+          sendInput({ t: 'paste', text: manual });
+          document.getElementById('remoteCanvas').focus();
+        }
+      }
+    }
+
+    function normPos(canvas, e) {
+      const rect = canvas.getBoundingClientRect();
+      const x = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+      const y = Math.max(0, Math.min(1, (e.clientY - rect.top) / rect.height));
+      return { x, y };
+    }
+
+    function setupCanvasEvents() {
+      const canvas = document.getElementById('remoteCanvas');
+
+      canvas.addEventListener('contextmenu', e => e.preventDefault());
+
+      canvas.addEventListener('mousemove', e => {
+        const now = performance.now();
+        if (now - lastMoveSent < 25) return;
+        lastMoveSent = now;
+        const p = normPos(canvas, e);
+        sendInput({ t: 'move', x: p.x, y: p.y });
+      });
+
+      let pressedButtons = new Set();
+      let pressedKeys = new Set();
+
+      canvas.addEventListener('mousedown', e => {
+        e.preventDefault();
+        canvas.focus();
+        pressedButtons.add(e.button);
+        const p = normPos(canvas, e);
+        sendInput({ t: 'down', b: e.button, x: p.x, y: p.y });
+      });
+
+      window.addEventListener('mouseup', e => {
+        if (!pressedButtons.has(e.button)) return;
+        pressedButtons.delete(e.button);
+        const p = normPos(canvas, e);
+        sendInput({ t: 'up', b: e.button, x: p.x, y: p.y });
+      });
+
+      window.addEventListener('blur', () => {
+        for (const b of pressedButtons) {
+          sendInput({ t: 'up', b, x: 0.5, y: 0.5 });
+        }
+        pressedButtons.clear();
+        for (const vk of pressedKeys) {
+          sendInput({ t: 'keyup', vk });
+        }
+        pressedKeys.clear();
+      });
+
+      canvas.addEventListener('wheel', e => {
+        e.preventDefault();
+        const p = normPos(canvas, e);
+        const dy = e.deltaY < 0 ? 120 : -120;
+        sendInput({ t: 'wheel', dy, x: p.x, y: p.y });
+      }, { passive: false });
+
+      canvas.addEventListener('keydown', e => {
+        e.preventDefault();
+        const vk = mapKeyToVK(e);
+        if (vk > 0) {
+          pressedKeys.add(vk);
+          sendInput({ t: 'keydown', vk });
+        }
+      });
+
+      canvas.addEventListener('keyup', e => {
+        e.preventDefault();
+        const vk = mapKeyToVK(e);
+        if (vk > 0) {
+          pressedKeys.delete(vk);
+          sendInput({ t: 'keyup', vk });
+        }
+      });
+    }
+
+    function mapKeyToVK(e) {
+      // Browser keyCode matches Windows VK codes for almost all standard keys.
+      if (e.code === 'MetaLeft') return 0x5B;
+      if (e.code === 'MetaRight') return 0x5C;
+      return e.keyCode || 0;
     }
 
     async function pollState() {
       const st = await go().GetState();
       const badge = document.getElementById('serverBadge');
+      const hostBadge = document.getElementById('hostBadge');
       const isConn = st.server_state === 'connected';
       const isConnecting = st.server_state === 'connecting';
 
       badge.className = 'badge ' + (isConn ? 'connected' : isConnecting ? 'connecting' : '');
       badge.textContent = isConn ? '服务端已连接' : isConnecting ? '正在连接...' : '未连接服务端';
 
+      hostBadge.className = 'badge ' + (st.host_active ? 'connected' : '');
+      hostBadge.textContent = st.host_active ? '本机可被同屏远控' : '受控服务未开启';
+
       document.getElementById('btnConnectServer').disabled = isConn || isConnecting;
       document.getElementById('btnDisconnectServer').disabled = !isConn && !isConnecting;
       document.getElementById('btnRefreshPeers').disabled = !isConn;
+      document.getElementById('btnConnectBuiltin').disabled = !isConn;
+      document.getElementById('btnSendFile').disabled = !isConn || !!st.transfer_active;
       document.getElementById('btnConnectRDP').disabled = !isConn;
       document.getElementById('btnDisconnectRDP').disabled = !st.tunnel_active;
+
+      const xferBox = document.getElementById('transferBox');
+      const vXferBar = document.getElementById('viewerTransferBar');
+      if (st.transfer_text) {
+        xferBox.style.display = 'flex';
+        document.getElementById('transferText').textContent = st.transfer_text;
+        const pct = st.transfer_percent || 0;
+        document.getElementById('transferPct').textContent = st.transfer_active ? (pct + '%') : (pct === 100 ? '完成' : '提示');
+        document.getElementById('transferPct').className = 'badge ' + (st.transfer_active ? 'connecting' : (pct === 100 ? 'connected' : ''));
+        document.getElementById('transferBar').style.width = pct + '%';
+        if (st.transfer_active) {
+          vXferBar.style.display = 'block';
+          vXferBar.textContent = st.transfer_text;
+        } else {
+          vXferBar.style.display = 'none';
+        }
+      } else {
+        xferBox.style.display = 'none';
+        vXferBar.style.display = 'none';
+      }
+
+      const openBtn = document.getElementById('btnOpenViewer');
+      openBtn.style.display = (st.tunnel_active && st.tunnel_kind === 'builtin' && st.viewer_ws_url) ? 'inline-block' : 'none';
 
       const tBox = document.getElementById('tunnelBox');
       if (st.tunnel_active) {
         tBox.style.display = 'flex';
+        const kindLabel = st.tunnel_kind === 'builtin' ? '内置同屏' : '系统 RDP';
         document.getElementById('tunnelInfo').textContent =
-          `本地映射: ${st.listen_addr} → ${st.target_client_id} (${st.remote_addr}) | 延迟: ${st.rtt_ms} ms`;
+          `[${kindLabel}] ${st.target_client_id} (${st.remote_addr}) | 延迟: ${st.rtt_ms} ms`;
         document.getElementById('tunnelBadge').textContent = (st.tunnel_mode || 'p2p').toUpperCase();
+        currentRTT = st.rtt_ms || 0;
       } else {
         tBox.style.display = 'none';
+        if (viewerWS) {
+          closeViewerWS();
+          hideViewer();
+        }
       }
 
       const logsEl = document.getElementById('logs');
@@ -238,4 +756,3 @@
   </script>
 </body>
 </html>
-
